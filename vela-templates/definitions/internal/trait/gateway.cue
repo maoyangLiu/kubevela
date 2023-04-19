@@ -5,27 +5,29 @@ gateway: {
 	description: "Enable public web traffic for the component, the ingress API matches K8s v1.20+."
 	attributes: {
 		podDisruptive: false
-		appliesToWorkloads: ["*"]
+		appliesToWorkloads: ["deployments.apps", "statefulsets.apps"]
+
 		status: {
 			customStatus: #"""
-				let igs = context.outputs.ingress.status.loadBalancer.ingress
-				if igs == _|_ {
+				if context.outputs.ingress.status.loadBalancer.ingress == _|_ {
 				  message: "No loadBalancer found, visiting by using 'vela port-forward " + context.appName + "'\n"
 				}
-				if len(igs) > 0 {
+				if context.outputs.ingress.status.loadBalancer.ingress != _|_ {
+					let igs = context.outputs.ingress.status.loadBalancer.ingress
+					let host = context.outputs.ingress.spec.rules[0].host
 				  if igs[0].ip != _|_ {
-				  	if igs[0].host != _|_ {
+				  	if host != _|_ {
 					    message: "Visiting URL: " + context.outputs.ingress.spec.rules[0].host + ", IP: " + igs[0].ip
 				  	}
-				  	if igs[0].host == _|_ {
-					    message: "Host not specified, visit the cluster or load balancer in front of the cluster"
+				  	if host == _|_ {
+					    message: "Host not specified, visit the cluster or load balancer in front of the cluster with IP: " + igs[0].ip
 				  	}
 				  }
 				  if igs[0].ip == _|_ {
-				  	if igs[0].host != _|_ {
+				  	if host != _|_ {
 						  message: "Visiting URL: " + context.outputs.ingress.spec.rules[0].host
 						}
-				  	if igs[0].host != _|_ {
+				  	if host == _|_ {
 					    message: "Host not specified, visit the cluster or load balancer in front of the cluster"
 						}
 				  }
@@ -54,14 +56,23 @@ template: {
 		}
 	}
 
+	legacyAPI: context.clusterVersion.minor < 19
 	outputs: ingress: {
-		apiVersion: "networking.k8s.io/v1"
-		kind:       "Ingress"
+		if legacyAPI {
+			apiVersion: "networking.k8s.io/v1beta1"
+		}
+		if !legacyAPI {
+			apiVersion: "networking.k8s.io/v1"
+		}
+		kind: "Ingress"
 		metadata: {
 			name: context.name
 			annotations: {
 				if !parameter.classInSpec {
 					"kubernetes.io/ingress.class": parameter.class
+				}
+				if parameter.gatewayHost != _|_ {
+					"ingress.controller/host": parameter.gatewayHost
 				}
 			}
 		}
@@ -85,9 +96,17 @@ template: {
 					for k, v in parameter.http {
 						path:     k
 						pathType: "ImplementationSpecific"
-						backend: service: {
-							name: context.name
-							port: number: v
+						backend: {
+							if legacyAPI {
+								serviceName: context.name
+								servicePort: v
+							}
+							if !legacyAPI {
+								service: {
+									name: context.name
+									port: number: v
+								}
+							}
 						}
 					},
 				]
@@ -108,7 +127,10 @@ template: {
 		// +usage=Set ingress class in '.spec.ingressClassName' instead of 'kubernetes.io/ingress.class' annotation.
 		classInSpec: *false | bool
 
-		// +usage=Specify the secret name you want to quote.
+		// +usage=Specify the secret name you want to quote to use tls.
 		secretName?: string
+
+		// +usage=Specify the host of the ingress gateway, which is used to generate the endpoints when the host is empty.
+		gatewayHost?: string
 	}
 }

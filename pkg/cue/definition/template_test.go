@@ -20,11 +20,14 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 
+	"github.com/kubevela/workflow/pkg/cue/packages"
+	wfprocess "github.com/kubevela/workflow/pkg/cue/process"
+
 	"github.com/oam-dev/kubevela/apis/types"
-	"github.com/oam-dev/kubevela/pkg/cue/packages"
 	"github.com/oam-dev/kubevela/pkg/cue/process"
 )
 
@@ -214,6 +217,24 @@ parameter: {
 			}},
 			hasCompileErr: true,
 		},
+		"cluster version info": {
+			workloadTemplate: `
+output:{
+  if context.clusterVersion.minor <  19 {
+    apiVersion: "networking.k8s.io/v1beta1"
+  }
+  if context.clusterVersion.minor >= 19 {
+    apiVersion: "networking.k8s.io/v1"
+  }
+  "kind":       "Ingress",
+}
+`,
+			params: map[string]interface{}{},
+			expectObj: &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "networking.k8s.io/v1",
+				"kind":       "Ingress",
+			}},
+		},
 	}
 
 	for _, v := range testCases {
@@ -222,6 +243,7 @@ parameter: {
 			CompName:        "test",
 			Namespace:       "default",
 			AppRevisionName: "myapp-v1",
+			ClusterVersion:  types.ClusterVersion{Minor: "19+"},
 		})
 		wt := NewWorkloadAbstractEngine("testWorkload", &packages.PackageDiscover{})
 		err := wt.Complete(ctx, v.workloadTemplate, v.params)
@@ -961,16 +983,6 @@ parameter: [string]: string`,
 			params:        map[string]interface{}{},
 			hasCompileErr: true,
 		},
-		"incorrect use of the map field in patch will raise error": {
-			traitTemplate: `
-patch: {
-	metadata: annotations: parameter.none
-}
-
-parameter: [string]: string`,
-			params:        map[string]interface{}{},
-			hasCompileErr: true,
-		},
 		"out-of-scope variables in patch will raise error": {
 			traitTemplate: `
 patchOutputs: {
@@ -992,7 +1004,7 @@ patch: {
 
 parameter: [string]: string`,
 			params: map[string]interface{}{
-				"wrong-keyword": "_|_ //",
+				"wrong-keyword": 5,
 			},
 			hasCompileErr: true,
 		},
@@ -1080,22 +1092,23 @@ parameter: { errs: [...string] }`,
 			return
 		}
 		td := NewTraitAbstractEngine(v.traitName, &packages.PackageDiscover{})
+		r := require.New(t)
 		err := td.Complete(ctx, v.traitTemplate, v.params)
-		hasError := err != nil
-		assert.Equal(t, v.hasCompileErr, hasError)
 		if v.hasCompileErr {
+			r.Error(err, cassinfo)
 			continue
 		}
+		r.NoError(err, cassinfo)
 		base, assists := ctx.Output()
-		assert.Equal(t, len(v.expAssObjs), len(assists), cassinfo)
-		assert.NotNil(t, base)
+		r.Equal(len(v.expAssObjs), len(assists), cassinfo)
+		r.NotNil(base)
 		obj, err := base.Unstructured()
-		assert.NoError(t, err, base.String())
-		assert.Equal(t, v.expWorkload, obj, cassinfo)
+		r.NoError(err)
+		r.Equal(v.expWorkload, obj, cassinfo)
 		for _, ss := range assists {
 			got, err := ss.Ins.Unstructured()
-			assert.NoError(t, err, cassinfo)
-			assert.Equal(t, v.expAssObjs[ss.Type+ss.Name], got, "case %s , type: %s name: %s", cassinfo, ss.Type, ss.Name)
+			r.NoError(err, cassinfo)
+			r.Equal(v.expAssObjs[ss.Type+ss.Name], got, "case %s , type: %s name: %s, got: %s", cassinfo, ss.Type, ss.Name, got)
 		}
 	}
 }
@@ -1178,7 +1191,9 @@ outputs: service :{
 		_, assists := ctx.Output()
 		for i, ss := range assists {
 			assert.Equal(t, ss.Name, v.order[i].name)
-			assert.Equal(t, ss.Ins.String(), v.order[i].content)
+			s, err := ss.Ins.String()
+			assert.NoError(t, err)
+			assert.Equal(t, s, v.order[i].content)
 		}
 	}
 }
@@ -1261,7 +1276,9 @@ outputs: abc :{
 		_, assists := ctx.Output()
 		for i, ss := range assists {
 			assert.Equal(t, ss.Name, v.order[i].name)
-			assert.Equal(t, ss.Ins.String(), v.order[i].content)
+			s, err := ss.Ins.String()
+			assert.NoError(t, err)
+			assert.Equal(t, s, v.order[i].content)
 		}
 	}
 }
@@ -1270,6 +1287,7 @@ func TestCheckHealth(t *testing.T) {
 	cases := map[string]struct {
 		tpContext  map[string]interface{}
 		healthTemp string
+		parameter  interface{}
 		exp        bool
 	}{
 		"normal-equal": {
@@ -1282,6 +1300,7 @@ func TestCheckHealth(t *testing.T) {
 				},
 			},
 			healthTemp: "isHealth:  context.output.status.readyReplicas == context.output.status.replicas",
+			parameter:  nil,
 			exp:        true,
 		},
 		"normal-false": {
@@ -1294,6 +1313,7 @@ func TestCheckHealth(t *testing.T) {
 				},
 			},
 			healthTemp: "isHealth: context.output.status.readyReplicas == context.output.status.replicas",
+			parameter:  nil,
 			exp:        false,
 		},
 		"array-case-equal": {
@@ -1307,11 +1327,33 @@ func TestCheckHealth(t *testing.T) {
 				},
 			},
 			healthTemp: `isHealth: context.output.status.conditions[0].status == "True"`,
+			parameter:  nil,
 			exp:        true,
+		},
+		"parameter-false": {
+			tpContext: map[string]interface{}{
+				"output": map[string]interface{}{
+					"status": map[string]interface{}{
+						"replicas": 4,
+					},
+				},
+				"outputs": map[string]interface{}{
+					"my": map[string]interface{}{
+						"status": map[string]interface{}{
+							"readyReplicas": 4,
+						},
+					},
+				},
+			},
+			healthTemp: "isHealth: context.outputs[parameter.res].status.readyReplicas == context.output.status.replicas",
+			parameter: map[string]string{
+				"res": "my",
+			},
+			exp: true,
 		},
 	}
 	for message, ca := range cases {
-		healthy, err := checkHealth(ca.tpContext, ca.healthTemp)
+		healthy, err := checkHealth(ca.tpContext, ca.healthTemp, ca.parameter)
 		assert.NoError(t, err, message)
 		assert.Equal(t, ca.exp, healthy, message)
 	}
@@ -1437,5 +1479,90 @@ if len(context.outputs.ingress.status.loadBalancer.ingress) == 0 {
 		gotMessage, err := getStatusMessage(&packages.PackageDiscover{}, ca.tpContext, ca.statusTemp, ca.parameter)
 		assert.NoError(t, err, message)
 		assert.Equal(t, ca.expMessage, gotMessage, message)
+	}
+}
+
+func TestTraitPatchSingleOutput(t *testing.T) {
+	baseTemplate := `
+	output: {
+      	apiVersion: "apps/v1"
+      	kind:       "Deployment"
+      	spec: selector: matchLabels: "app.oam.dev/component": context.name
+	}
+
+	outputs: gameconfig: {
+      	apiVersion: "v1"
+      	kind:       "ConfigMap"
+      	metadata: name: context.name + "game-config"
+      	data: {}
+	}
+
+	outputs: sideconfig: {
+      	apiVersion: "v1"
+      	kind:       "ConfigMap"
+      	metadata: name: context.name + "side-config"
+      	data: {}
+	}
+
+	parameter: {}
+`
+	traitTemplate := `
+	patchOutputs: sideconfig: data: key: "val"
+	parameter: {}
+`
+	ctx := process.NewContext(process.ContextData{
+		AppName:         "myapp",
+		CompName:        "test",
+		Namespace:       "default",
+		AppRevisionName: "myapp-v1",
+	})
+	wt := NewWorkloadAbstractEngine("-", &packages.PackageDiscover{})
+	if err := wt.Complete(ctx, baseTemplate, map[string]interface{}{}); err != nil {
+		t.Error(err)
+		return
+	}
+	td := NewTraitAbstractEngine("single-patch", &packages.PackageDiscover{})
+	r := require.New(t)
+	err := td.Complete(ctx, traitTemplate, map[string]string{})
+	r.NoError(err)
+	base, assists := ctx.Output()
+	r.NotNil(base)
+	r.Equal(2, len(assists))
+	got, err := assists[1].Ins.Unstructured()
+	r.NoError(err)
+	val, ok, err := unstructured.NestedString(got.Object, "data", "key")
+	r.NoError(err)
+	r.True(ok)
+	r.Equal("val", val)
+}
+
+func TestTraitCompleteErrorCases(t *testing.T) {
+	cases := map[string]struct {
+		ctx       wfprocess.Context
+		traitName string
+		template  string
+		params    map[string]interface{}
+		err       string
+	}{
+		"patch trait": {
+			ctx: process.NewContext(process.ContextData{}),
+			template: `
+patch: {
+      // +patchKey=name
+      spec: template: spec: containers: [parameter]
+}
+parameter: {
+	name: string
+	image: string
+	command?: [...string]
+}`,
+			err: "patch trait patch trait into an invalid workload",
+		},
+	}
+	for k, v := range cases {
+		td := NewTraitAbstractEngine(k, &packages.PackageDiscover{})
+		err := td.Complete(v.ctx, v.template, v.params)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), v.err)
 	}
 }

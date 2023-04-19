@@ -41,12 +41,13 @@ import (
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	"github.com/kubevela/workflow/pkg/cue/packages"
+
 	commontypes "github.com/oam-dev/kubevela/apis/core.oam.dev/common"
 	"github.com/oam-dev/kubevela/apis/core.oam.dev/condition"
 	"github.com/oam-dev/kubevela/apis/core.oam.dev/v1alpha2"
 	"github.com/oam-dev/kubevela/apis/core.oam.dev/v1beta1"
 	"github.com/oam-dev/kubevela/pkg/controller/common"
-	"github.com/oam-dev/kubevela/pkg/cue/packages"
 	"github.com/oam-dev/kubevela/pkg/oam"
 	"github.com/oam-dev/kubevela/pkg/oam/discoverymapper"
 	"github.com/oam-dev/kubevela/pkg/oam/util"
@@ -66,7 +67,6 @@ const LabelPodSpecable = "workload.oam.dev/podspecable"
 // allBuiltinCapabilities includes all builtin controllers
 // TODO(zzxwill) needs to automatically discovery all controllers
 var allBuiltinCapabilities = mapset.NewSet(
-	common.ManualScalerTraitControllerName,
 	common.RolloutControllerName,
 	common.HealthScopeControllerName,
 	common.EnvBindingControllerName,
@@ -258,6 +258,7 @@ func ComputeSpecHash(spec interface{}) (string, error) {
 }
 
 // RefreshPackageDiscover help refresh package discover
+// Deprecated: The function RefreshKubePackagesFromCluster affects performance and the code has been commented a long time.
 func RefreshPackageDiscover(ctx context.Context, k8sClient client.Client, dm discoverymapper.DiscoveryMapper,
 	pd *packages.PackageDiscover, definition runtime.Object) error {
 	var gvk metav1.GroupVersionKind

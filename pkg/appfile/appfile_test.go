@@ -22,7 +22,7 @@ import (
 	"fmt"
 	"testing"
 
-	"cuelang.org/go/cue"
+	"cuelang.org/go/cue/cuecontext"
 	"github.com/crossplane/crossplane-runtime/pkg/test"
 	"github.com/google/go-cmp/cmp"
 	terraformtypes "github.com/oam-dev/terraform-controller/api/types/crossplane-runtime"
@@ -38,11 +38,13 @@ import (
 	"k8s.io/utils/pointer"
 	"sigs.k8s.io/yaml"
 
+	"github.com/kubevela/workflow/pkg/cue/model"
+
 	"github.com/oam-dev/kubevela/apis/core.oam.dev/common"
 	"github.com/oam-dev/kubevela/apis/core.oam.dev/v1beta1"
 	oamtypes "github.com/oam-dev/kubevela/apis/types"
 	"github.com/oam-dev/kubevela/pkg/cue/definition"
-	"github.com/oam-dev/kubevela/pkg/cue/model"
+	"github.com/oam-dev/kubevela/pkg/cue/process"
 	"github.com/oam-dev/kubevela/pkg/oam"
 	"github.com/oam-dev/kubevela/pkg/oam/util"
 )
@@ -82,19 +84,6 @@ var _ = Describe("Test Helm schematic appfile", func() {
 								"replicas": float64(10),
 							},
 							engine: definition.NewTraitAbstractEngine("scaler", pd),
-							Template: `
-      outputs: scaler: {
-      	apiVersion: "core.oam.dev/v1alpha2"
-      	kind:       "ManualScalerTrait"
-      	spec: {
-      		replicaCount: parameter.replicas
-      	}
-      }
-      parameter: {
-      	//+short=r
-      	replicas: *1 | int
-      }
-`,
 						},
 					},
 					FullTemplate: &Template{
@@ -138,24 +127,6 @@ var _ = Describe("Test Helm schematic appfile", func() {
 							"app.oam.dev/name":        appName,
 							"app.oam.dev/appRevision": appName + "-v1",
 						}}}},
-			Traits: []*unstructured.Unstructured{
-				{
-					Object: map[string]interface{}{
-						"apiVersion": "core.oam.dev/v1alpha2",
-						"kind":       "ManualScalerTrait",
-						"metadata": map[string]interface{}{
-							"labels": map[string]interface{}{
-								"app.oam.dev/component":   compName,
-								"app.oam.dev/name":        appName,
-								"trait.oam.dev/type":      "scaler",
-								"trait.oam.dev/resource":  "scaler",
-								"app.oam.dev/appRevision": appName + "-v1",
-							},
-						},
-						"spec": map[string]interface{}{"replicaCount": int64(10)},
-					},
-				},
-			},
 			PackagedWorkloadResources: []*unstructured.Unstructured{
 				{
 					Object: map[string]interface{}{
@@ -256,19 +227,6 @@ spec:
 								"replicas": float64(10),
 							},
 							engine: definition.NewTraitAbstractEngine("scaler", pd),
-							Template: `
-      outputs: scaler: {
-      	apiVersion: "core.oam.dev/v1alpha2"
-      	kind:       "ManualScalerTrait"
-      	spec: {
-      		replicaCount: parameter.replicas
-      	}
-      }
-      parameter: {
-      	//+short=r
-      	replicas: *1 | int
-      }
-`,
 						},
 					},
 					FullTemplate: &Template{
@@ -278,7 +236,7 @@ spec:
 								{
 									Name:       "image",
 									ValueType:  common.StringType,
-									Required:   pointer.BoolPtr(true),
+									Required:   pointer.Bool(true),
 									FieldPaths: []string{"spec.template.spec.containers[0].image"},
 								},
 							},
@@ -326,24 +284,6 @@ spec:
 		expectCompManifest := &oamtypes.ComponentManifest{
 			Name:             compName,
 			StandardWorkload: expectWorkload,
-			Traits: []*unstructured.Unstructured{
-				{
-					Object: map[string]interface{}{
-						"apiVersion": "core.oam.dev/v1alpha2",
-						"kind":       "ManualScalerTrait",
-						"metadata": map[string]interface{}{
-							"labels": map[string]interface{}{
-								"app.oam.dev/component":   compName,
-								"app.oam.dev/name":        appName,
-								"app.oam.dev/appRevision": appName + "-v1",
-								"trait.oam.dev/type":      "scaler",
-								"trait.oam.dev/resource":  "scaler",
-							},
-						},
-						"spec": map[string]interface{}{"replicaCount": int64(10)},
-					},
-				},
-			},
 		}
 		By("Verify expected Component")
 		diff := cmp.Diff(comps[0], expectCompManifest)
@@ -452,6 +392,14 @@ spec:
 					},
 		}
 	}
+	outputs: virtualservice: {
+		apiVersion: "networking.istio.io/v1alpha3"
+		kind:       "VirtualService"
+		spec: {
+			hosts: "abc"
+			http: ["abc"]
+		}
+	}
 	parameter: {
 		boundComponents: [...string]
 	}`},
@@ -467,7 +415,7 @@ spec:
 		Expect(err).Should(BeNil())
 		Expect(len(gotPolicies)).ShouldNot(Equal(0))
 
-		expectPolicy := unstructured.Unstructured{
+		expectPolicy0 := unstructured.Unstructured{
 			Object: map[string]interface{}{
 				"spec": map[string]interface{}{
 					"compName": "test-comp",
@@ -484,17 +432,38 @@ spec:
 						"app.oam.dev/name":        "test-app",
 						"app.oam.dev/component":   "test-policy",
 						"app.oam.dev/appRevision": "",
-						"workload.oam.dev/type":   "test-policy",
 					},
 				},
 				"apiVersion": "core.oam.dev/v1alpha2",
 				"kind":       "HealthScope",
 			},
 		}
-		Expect(len(gotPolicies)).ShouldNot(Equal(0))
+		Expect(len(gotPolicies)).Should(Equal(2))
 		gotPolicy := gotPolicies[0]
-		Expect(cmp.Diff(gotPolicy.Object, expectPolicy.Object)).Should(BeEmpty())
+		Expect(cmp.Diff(gotPolicy.Object, expectPolicy0.Object)).Should(BeEmpty())
+		expectPolicy1 := unstructured.Unstructured{
+			Object: map[string]interface{}{
+				"spec": map[string]interface{}{
+					"hosts": "abc",
+					"http":  []interface{}{"abc"},
+				},
+				"metadata": map[string]interface{}{
+					"name":      "test-policy",
+					"namespace": "default",
+					"labels": map[string]interface{}{
+						"app.oam.dev/name":        "test-app",
+						"app.oam.dev/component":   "test-policy",
+						"app.oam.dev/appRevision": "",
+					},
+				},
+				"apiVersion": "networking.istio.io/v1alpha3",
+				"kind":       "VirtualService",
+			},
+		}
+		gotPolicy = gotPolicies[1]
+		Expect(cmp.Diff(gotPolicy.Object, expectPolicy1.Object)).Should(BeEmpty())
 	})
+
 })
 
 var _ = Describe("Test Terraform schematic appfile", func() {
@@ -573,7 +542,7 @@ variable "password" {
 				"writeConnectionSecretToRef": map[string]interface{}{
 					"name": "db",
 				},
-				model.OutputSecretName: "db-conn",
+				process.OutputSecretName: "db-conn",
 			},
 		}
 
@@ -632,7 +601,7 @@ func TestResolveKubeParameters(t *testing.T) {
 	}
 	requiredParam := &common.KubeParameter{
 		Name:       "reqParam",
-		Required:   pointer.BoolPtr(true),
+		Required:   pointer.Bool(true),
 		ValueType:  common.StringType,
 		FieldPaths: []string{"spec"},
 	}
@@ -814,7 +783,7 @@ var _ = Describe("Test evalWorkloadWithContext", func() {
 
 		args := appArgs{
 			wl: &Workload{
-				Name: "sample-db",
+				Name: compName,
 				FullTemplate: &Template{
 					Terraform: &common.Terraform{
 						Configuration: `
@@ -891,7 +860,7 @@ variable "password" {
 			AppRevisionName: args.revision,
 		}, args.wl.Name)
 		pCtx := NewBasicContext(ctxData, args.wl.Params)
-		comp, err := evalWorkloadWithContext(pCtx, args.wl, ns, args.appName, compName)
+		comp, err := evalWorkloadWithContext(pCtx, args.wl, ns, args.appName)
 		Expect(comp.StandardWorkload).ShouldNot(BeNil())
 		Expect(comp.Name).Should(Equal(""))
 		Expect(err).Should(BeNil())
@@ -1160,7 +1129,7 @@ spec:
 						{
 							Name:       "image",
 							ValueType:  common.StringType,
-							Required:   pointer.BoolPtr(true),
+							Required:   pointer.Bool(true),
 							FieldPaths: []string{"spec.template.spec.containers[0].image"},
 						},
 					},
@@ -1178,33 +1147,32 @@ spec:
 			CapabilityCategory: oamtypes.KubeCategory,
 		},
 		expectData: `
-output: { 
-apiVersion: "apps/v1"
-kind:       "Deployment"
-spec: {
-	selector: {
-		matchLabels: {
-			app: "nginx"
-		}
-	}
-	template: {
-		spec: {
-			containers: [{
-				name:  "nginx"
-				image: "nginx:1.14.0"
-			}]
-			ports: [{
-				containerPort: 80
-			}]
-		}
-		metadata: {
-			labels: {
+output: {
+	apiVersion: "apps/v1"
+	kind:       "Deployment"
+	spec: {
+		selector: {
+			matchLabels: {
 				app: "nginx"
 			}
 		}
+		template: {
+			metadata: {
+				labels: {
+					app: "nginx"
+				}
+			}
+			spec: {
+				containers: [{
+					image: "nginx:1.14.0"
+					name:  "nginx"
+				}]
+				ports: [{
+					containerPort: 80
+				}]
+			}
+		}
 	}
-}
- 
 }`,
 		hasError: false,
 	}, "Kube workload with wrong template": {
@@ -1216,7 +1184,7 @@ spec: {
 						{
 							Name:       "image",
 							ValueType:  common.StringType,
-							Required:   pointer.BoolPtr(true),
+							Required:   pointer.Bool(true),
 							FieldPaths: []string{"spec.template.spec.containers[0].image"},
 						},
 					},
@@ -1244,7 +1212,7 @@ spec: {
 						{
 							Name:       "image",
 							ValueType:  common.StringType,
-							Required:   pointer.BoolPtr(true),
+							Required:   pointer.Bool(true),
 							FieldPaths: []string{"spec.template.spec.containers[0].image"},
 						},
 					},
@@ -1297,14 +1265,14 @@ output: {
 		errInfo:  "unexpected GroupVersion string: app@//v1",
 	}}
 
-	for _, tc := range testcases {
+	for i, tc := range testcases {
 		template, err := GenerateCUETemplate(tc.workload)
 		assert.Equal(t, err != nil, tc.hasError)
 		if tc.hasError {
 			assert.Equal(t, tc.errInfo, err.Error())
 			continue
 		}
-		assert.Equal(t, tc.expectData, template)
+		assert.Equal(t, tc.expectData, template, i)
 	}
 }
 
@@ -1395,11 +1363,9 @@ func TestBaseGenerateComponent(t *testing.T) {
 		}
 	}
 `
-	var r cue.Runtime
-	inst, err := r.Compile("-", base)
-	assert.NilError(t, err)
+	inst := cuecontext.New().CompileString(base)
 	bs, _ := model.NewBase(inst.Value())
-	err = pContext.SetBase(bs)
+	err := pContext.SetBase(bs)
 	assert.NilError(t, err)
 	tr := &Trait{
 		Name:   traitName,

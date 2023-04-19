@@ -28,12 +28,14 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/yaml"
 
+	workflowv1alpha1 "github.com/kubevela/workflow/api/v1alpha1"
+	"github.com/kubevela/workflow/pkg/cue/packages"
+
 	"github.com/oam-dev/kubevela/apis/core.oam.dev/common"
 	"github.com/oam-dev/kubevela/apis/core.oam.dev/v1alpha1"
 	"github.com/oam-dev/kubevela/apis/core.oam.dev/v1beta1"
 	"github.com/oam-dev/kubevela/apis/types"
 	"github.com/oam-dev/kubevela/pkg/appfile"
-	"github.com/oam-dev/kubevela/pkg/cue/packages"
 	"github.com/oam-dev/kubevela/pkg/oam"
 	"github.com/oam-dev/kubevela/pkg/oam/discoverymapper"
 )
@@ -41,7 +43,7 @@ import (
 // NewLiveDiffOption creates a live-diff option
 func NewLiveDiffOption(c client.Client, cfg *rest.Config, dm discoverymapper.DiscoveryMapper, pd *packages.PackageDiscover, as []oam.Object) *LiveDiffOption {
 	parser := appfile.NewApplicationParser(c, dm, pd)
-	return &LiveDiffOption{DryRun: NewDryRunOption(c, cfg, dm, pd, as), Parser: parser}
+	return &LiveDiffOption{DryRun: NewDryRunOption(c, cfg, dm, pd, as, false), Parser: parser}
 }
 
 // ManifestKind enums the kind of OAM objects
@@ -232,8 +234,9 @@ func (l *LiveDiffOption) diffManifest(base, comparor *manifest) *DiffEntry {
 
 // Diff does three phases, dry-run on input app, preparing manifest for diff, and
 // calculating diff on manifests.
+// TODO(wonderflow): vela live-diff don't diff for policies now.
 func (l *LiveDiffOption) Diff(ctx context.Context, app *v1beta1.Application, appRevision *v1beta1.ApplicationRevision) (*DiffEntry, error) {
-	comps, err := l.ExecuteDryRun(ctx, app)
+	comps, _, err := l.ExecuteDryRun(ctx, app)
 	if err != nil {
 		return nil, errors.WithMessagef(err, "cannot dry-run for app %q", app.Name)
 	}
@@ -254,8 +257,9 @@ func (l *LiveDiffOption) Diff(ctx context.Context, app *v1beta1.Application, app
 
 // DiffApps does three phases, dry-run on input app, preparing manifest for diff, and
 // calculating diff on manifests.
+// TODO(wonderflow): vela live-diff don't diff for policies now.
 func (l *LiveDiffOption) DiffApps(ctx context.Context, app *v1beta1.Application, oldApp *v1beta1.Application) (*DiffEntry, error) {
-	comps, err := l.ExecuteDryRun(ctx, app)
+	comps, _, err := l.ExecuteDryRun(ctx, app)
 	if err != nil {
 		return nil, errors.WithMessagef(err, "cannot dry-run for app %q", app.Name)
 	}
@@ -265,7 +269,7 @@ func (l *LiveDiffOption) DiffApps(ctx context.Context, app *v1beta1.Application,
 		return nil, errors.WithMessagef(err, "cannot generate diff manifest for app %q", app.Name)
 	}
 
-	oldComps, err := l.ExecuteDryRun(ctx, oldApp)
+	oldComps, _, err := l.ExecuteDryRun(ctx, oldApp)
 	if err != nil {
 		return nil, errors.WithMessagef(err, "cannot dry-run for app %q", oldApp.Name)
 	}
@@ -565,7 +569,7 @@ func marshalObject(o client.Object) ([]byte, error) {
 		obj.Status = common.AppStatus{}
 	case *v1alpha1.Policy:
 		obj.SetGroupVersionKind(v1alpha1.PolicyGroupVersionKind)
-	case *v1alpha1.Workflow:
+	case *workflowv1alpha1.Workflow:
 		obj.SetGroupVersionKind(v1alpha1.WorkflowGroupVersionKind)
 	}
 	o.SetLabels(clearedLabels(o.GetLabels()))

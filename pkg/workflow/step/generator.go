@@ -21,6 +21,8 @@ import (
 	"encoding/json"
 	"reflect"
 
+	workflowv1alpha1 "github.com/kubevela/workflow/api/v1alpha1"
+	wftypes "github.com/kubevela/workflow/pkg/types"
 	"github.com/pkg/errors"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -28,13 +30,11 @@ import (
 	"github.com/oam-dev/kubevela/apis/core.oam.dev/v1alpha1"
 	"github.com/oam-dev/kubevela/apis/core.oam.dev/v1beta1"
 	"github.com/oam-dev/kubevela/pkg/oam/util"
-	"github.com/oam-dev/kubevela/pkg/utils"
-	wftypes "github.com/oam-dev/kubevela/pkg/workflow/types"
 )
 
 // WorkflowStepGenerator generator generates workflow steps
 type WorkflowStepGenerator interface {
-	Generate(app *v1beta1.Application, existingSteps []v1beta1.WorkflowStep) ([]v1beta1.WorkflowStep, error)
+	Generate(app *v1beta1.Application, existingSteps []workflowv1alpha1.WorkflowStep) ([]workflowv1alpha1.WorkflowStep, error)
 }
 
 // ChainWorkflowStepGenerator chains multiple workflow step generators
@@ -43,7 +43,7 @@ type ChainWorkflowStepGenerator struct {
 }
 
 // Generate generate workflow steps
-func (g *ChainWorkflowStepGenerator) Generate(app *v1beta1.Application, existingSteps []v1beta1.WorkflowStep) (steps []v1beta1.WorkflowStep, err error) {
+func (g *ChainWorkflowStepGenerator) Generate(app *v1beta1.Application, existingSteps []workflowv1alpha1.WorkflowStep) (steps []workflowv1alpha1.WorkflowStep, err error) {
 	steps = existingSteps
 	for _, generator := range g.generators {
 		steps, err = generator.Generate(app, steps)
@@ -66,35 +66,37 @@ type RefWorkflowStepGenerator struct {
 }
 
 // Generate generate workflow steps
-func (g *RefWorkflowStepGenerator) Generate(app *v1beta1.Application, existingSteps []v1beta1.WorkflowStep) (steps []v1beta1.WorkflowStep, err error) {
+func (g *RefWorkflowStepGenerator) Generate(app *v1beta1.Application, existingSteps []workflowv1alpha1.WorkflowStep) (steps []workflowv1alpha1.WorkflowStep, err error) {
 	if app.Spec.Workflow == nil || app.Spec.Workflow.Ref == "" {
 		return existingSteps, nil
 	}
 	if app.Spec.Workflow.Steps != nil {
 		return nil, errors.Errorf("cannot set steps and ref in workflow at the same time")
 	}
-	wf := &v1alpha1.Workflow{}
+	wf := &workflowv1alpha1.Workflow{}
 	if err = g.Client.Get(g.Context, types.NamespacedName{Namespace: app.GetNamespace(), Name: app.Spec.Workflow.Ref}, wf); err != nil {
 		return
 	}
-	return ConvertSteps(wf.Steps), nil
+	return wf.Steps, nil
 }
 
 // ApplyComponentWorkflowStepGenerator generate apply-component workflow steps for all components in the application
 type ApplyComponentWorkflowStepGenerator struct{}
 
 // Generate generate workflow steps
-func (g *ApplyComponentWorkflowStepGenerator) Generate(app *v1beta1.Application, existingSteps []v1beta1.WorkflowStep) (steps []v1beta1.WorkflowStep, err error) {
+func (g *ApplyComponentWorkflowStepGenerator) Generate(app *v1beta1.Application, existingSteps []workflowv1alpha1.WorkflowStep) (steps []workflowv1alpha1.WorkflowStep, err error) {
 	if len(existingSteps) > 0 {
 		return existingSteps, nil
 	}
 	for _, comp := range app.Spec.Components {
-		steps = append(steps, v1beta1.WorkflowStep{
-			Name: comp.Name,
-			Type: wftypes.WorkflowStepTypeApplyComponent,
-			Properties: util.Object2RawExtension(map[string]string{
-				"component": comp.Name,
-			}),
+		steps = append(steps, workflowv1alpha1.WorkflowStep{
+			WorkflowStepBase: workflowv1alpha1.WorkflowStepBase{
+				Name: comp.Name,
+				Type: wftypes.WorkflowStepTypeApplyComponent,
+				Properties: util.Object2RawExtension(map[string]string{
+					"component": comp.Name,
+				}),
+			},
 		})
 	}
 	return
@@ -104,7 +106,7 @@ func (g *ApplyComponentWorkflowStepGenerator) Generate(app *v1beta1.Application,
 type Deploy2EnvWorkflowStepGenerator struct{}
 
 // Generate generate workflow steps
-func (g *Deploy2EnvWorkflowStepGenerator) Generate(app *v1beta1.Application, existingSteps []v1beta1.WorkflowStep) (steps []v1beta1.WorkflowStep, err error) {
+func (g *Deploy2EnvWorkflowStepGenerator) Generate(app *v1beta1.Application, existingSteps []workflowv1alpha1.WorkflowStep) (steps []workflowv1alpha1.WorkflowStep, err error) {
 	if len(existingSteps) > 0 {
 		return existingSteps, nil
 	}
@@ -115,13 +117,15 @@ func (g *Deploy2EnvWorkflowStepGenerator) Generate(app *v1beta1.Application, exi
 				return
 			}
 			for _, env := range spec.Envs {
-				steps = append(steps, v1beta1.WorkflowStep{
-					Name: "deploy-" + policy.Name + "-" + env.Name,
-					Type: "deploy2env",
-					Properties: util.Object2RawExtension(map[string]string{
-						"policy": policy.Name,
-						"env":    env.Name,
-					}),
+				steps = append(steps, workflowv1alpha1.WorkflowStep{
+					WorkflowStepBase: workflowv1alpha1.WorkflowStepBase{
+						Name: "deploy-" + policy.Name + "-" + env.Name,
+						Type: "deploy2env",
+						Properties: util.Object2RawExtension(map[string]string{
+							"policy": policy.Name,
+							"env":    env.Name,
+						}),
+					},
 				})
 			}
 		}
@@ -133,7 +137,7 @@ func (g *Deploy2EnvWorkflowStepGenerator) Generate(app *v1beta1.Application, exi
 type DeployWorkflowStepGenerator struct{}
 
 // Generate generate workflow steps
-func (g *DeployWorkflowStepGenerator) Generate(app *v1beta1.Application, existingSteps []v1beta1.WorkflowStep) (steps []v1beta1.WorkflowStep, err error) {
+func (g *DeployWorkflowStepGenerator) Generate(app *v1beta1.Application, existingSteps []workflowv1alpha1.WorkflowStep) (steps []workflowv1alpha1.WorkflowStep, err error) {
 	if len(existingSteps) > 0 {
 		return existingSteps, nil
 	}
@@ -148,36 +152,48 @@ func (g *DeployWorkflowStepGenerator) Generate(app *v1beta1.Application, existin
 		}
 	}
 	for _, topology := range topologies {
-		steps = append(steps, v1beta1.WorkflowStep{
-			Name: "deploy-" + topology,
-			Type: "deploy",
-			Properties: util.Object2RawExtension(map[string]interface{}{
-				"policies": append(overrides, topology),
-			}),
+		steps = append(steps, workflowv1alpha1.WorkflowStep{
+			WorkflowStepBase: workflowv1alpha1.WorkflowStepBase{
+				Name: "deploy-" + topology,
+				Type: "deploy",
+				Properties: util.Object2RawExtension(map[string]interface{}{
+					"policies": append(overrides, topology),
+				}),
+			},
 		})
 	}
-	return
-}
-
-// DeployPreApproveWorkflowStepGenerator generate suspend workflow steps before all deploy steps
-type DeployPreApproveWorkflowStepGenerator struct{}
-
-// Generate generate workflow steps
-func (g *DeployPreApproveWorkflowStepGenerator) Generate(app *v1beta1.Application, existingSteps []v1beta1.WorkflowStep) (steps []v1beta1.WorkflowStep, err error) {
-	lastSuspend := false
-	for _, step := range existingSteps {
-		if step.Type == "deploy" && !lastSuspend {
-			props := DeployWorkflowStepSpec{}
-			_ = utils.StrictUnmarshal(step.Properties.Raw, &props)
-			if props.Auto != nil && !*props.Auto {
-				steps = append(steps, v1beta1.WorkflowStep{
-					Name: "manual-approve-" + step.Name,
-					Type: wftypes.WorkflowStepTypeSuspend,
-				})
+	if len(topologies) == 0 {
+		containsRefObjects := false
+		for _, comp := range app.Spec.Components {
+			if comp.Type == v1alpha1.RefObjectsComponentType {
+				containsRefObjects = true
+				break
 			}
 		}
-		lastSuspend = step.Type == wftypes.WorkflowStepTypeSuspend
-		steps = append(steps, step)
+		if containsRefObjects || len(overrides) > 0 {
+			steps = append(steps, workflowv1alpha1.WorkflowStep{
+				WorkflowStepBase: workflowv1alpha1.WorkflowStepBase{
+					Name:       "deploy",
+					Type:       "deploy",
+					Properties: util.Object2RawExtension(map[string]interface{}{"policies": append([]string{}, overrides...)}),
+				},
+			})
+		}
 	}
 	return steps, nil
+}
+
+// IsBuiltinWorkflowStepType checks if workflow step type is builtin type
+func IsBuiltinWorkflowStepType(wfType string) bool {
+	for _, _type := range []string{
+		wftypes.WorkflowStepTypeSuspend,
+		wftypes.WorkflowStepTypeApplyComponent,
+		wftypes.WorkflowStepTypeBuiltinApplyComponent,
+		wftypes.WorkflowStepTypeStepGroup,
+	} {
+		if _type == wfType {
+			return true
+		}
+	}
+	return false
 }

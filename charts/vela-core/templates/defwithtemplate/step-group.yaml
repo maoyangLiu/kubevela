@@ -4,15 +4,14 @@ apiVersion: core.oam.dev/v1beta1
 kind: WorkflowStepDefinition
 metadata:
   annotations:
-    definition.oam.dev/description: step group
-  labels:
-    custom.definition.oam.dev/ui-hidden: "true"
+    custom.definition.oam.dev/category: Process Control
+    definition.oam.dev/description: A special step that you can declare 'subSteps' in it, 'subSteps' is an array containing any step type whose valid parameters do not include the `step-group` step type itself. The sub steps were executed in parallel.
   name: step-group
   namespace: {{ include "systemDefinitionNamespace" . }}
 spec:
   schematic:
     cue:
       template: |
-        // no parameters
-        parameter: {}
+        // no parameters, the nop only to make the template not empty or it's invalid
+        nop: {}
 

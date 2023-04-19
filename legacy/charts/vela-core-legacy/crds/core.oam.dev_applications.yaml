@@ -1,10 +1,9 @@
-
 ---
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
   annotations:
-    controller-gen.kubebuilder.io/version: v0.6.2
+    controller-gen.kubebuilder.io/version: v0.11.3
   name: applications.core.oam.dev
 spec:
   group: core.oam.dev
@@ -179,6 +178,7 @@ spec:
                               description: 'UID of the referent. More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#uids'
                               type: string
                           type: object
+                          x-kubernetes-map-type: atomic
                       required:
                       - name
                       type: object
@@ -313,6 +313,7 @@ spec:
                                       https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#uids'
                                     type: string
                                 type: object
+                                x-kubernetes-map-type: atomic
                             required:
                             - name
                             type: object
@@ -415,7 +416,6 @@ spec:
                     cluster:
                       type: string
                     creator:
-                      description: ResourceCreatorRole defines the resource creator.
                       type: string
                     fieldPath:
                       description: 'If referring to a piece of an object instead of
@@ -447,36 +447,37 @@ spec:
                       description: 'UID of the referent. More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#uids'
                       type: string
                   type: object
+                  x-kubernetes-map-type: atomic
                 type: array
               components:
                 description: Components record the related Components created by Application
                   Controller
                 items:
-                  description: 'ObjectReference contains enough information to let
+                  description: "ObjectReference contains enough information to let
                     you inspect or modify the referred object. --- New uses of this
                     type are discouraged because of difficulty describing its usage
-                    when embedded in APIs.  1. Ignored fields.  It includes many fields
+                    when embedded in APIs. 1. Ignored fields.  It includes many fields
                     which are not generally honored.  For instance, ResourceVersion
-                    and FieldPath are both very rarely valid in actual usage.  2.
-                    Invalid usage help.  It is impossible to add specific help for
-                    individual usage.  In most embedded usages, there are particular     restrictions
-                    like, "must refer only to types A and B" or "UID not honored"
-                    or "name must be restricted".     Those cannot be well described
-                    when embedded.  3. Inconsistent validation.  Because the usages
+                    and FieldPath are both very rarely valid in actual usage. 2. Invalid
+                    usage help.  It is impossible to add specific help for individual
+                    usage.  In most embedded usages, there are particular restrictions
+                    like, \"must refer only to types A and B\" or \"UID not honored\"
+                    or \"name must be restricted\". Those cannot be well described
+                    when embedded. 3. Inconsistent validation.  Because the usages
                     are different, the validation rules are different by usage, which
-                    makes it hard for users to predict what will happen.  4. The fields
+                    makes it hard for users to predict what will happen. 4. The fields
                     are both imprecise and overly precise.  Kind is not a precise
-                    mapping to a URL. This can produce ambiguity     during interpretation
+                    mapping to a URL. This can produce ambiguity during interpretation
                     and require a REST mapping.  In most cases, the dependency is
-                    on the group,resource tuple     and the version of the actual
-                    struct is irrelevant.  5. We cannot easily change it.  Because
-                    this type is embedded in many locations, updates to this type     will
-                    affect numerous schemas.  Don''t make new APIs embed an underspecified
-                    API type they do not control. Instead of using this type, create
+                    on the group,resource tuple and the version of the actual struct
+                    is irrelevant. 5. We cannot easily change it.  Because this type
+                    is embedded in many locations, updates to this type will affect
+                    numerous schemas.  Don't make new APIs embed an underspecified
+                    API type they do not control. \n Instead of using this type, create
                     a locally provided and used type that is well-focused on your
                     reference. For example, ServiceReferences for admission registration:
                     https://github.com/kubernetes/api/blob/release-1.17/admissionregistration/v1/types.go#L533
-                    .'
+                    ."
                   properties:
                     apiVersion:
                       description: API version of the referent.
@@ -511,6 +512,7 @@ spec:
                       description: 'UID of the referent. More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#uids'
                       type: string
                   type: object
+                  x-kubernetes-map-type: atomic
                 type: array
               conditions:
                 description: Conditions of the resource.
@@ -566,9 +568,10 @@ spec:
                 format: int64
                 type: integer
               policy:
-                description: PolicyStatus records the status of policy
+                description: PolicyStatus records the status of policy Deprecated
+                  This field is only used by EnvBinding Policy which is deprecated.
                 items:
-                  description: PolicyStatus records the status of policy
+                  description: PolicyStatus records the status of policy Deprecated
                   properties:
                     name:
                       type: string
@@ -602,33 +605,33 @@ spec:
                       type: string
                     scopes:
                       items:
-                        description: 'ObjectReference contains enough information
+                        description: "ObjectReference contains enough information
                           to let you inspect or modify the referred object. --- New
                           uses of this type are discouraged because of difficulty
-                          describing its usage when embedded in APIs.  1. Ignored
-                          fields.  It includes many fields which are not generally
-                          honored.  For instance, ResourceVersion and FieldPath are
-                          both very rarely valid in actual usage.  2. Invalid usage
-                          help.  It is impossible to add specific help for individual
-                          usage.  In most embedded usages, there are particular     restrictions
-                          like, "must refer only to types A and B" or "UID not honored"
-                          or "name must be restricted".     Those cannot be well described
-                          when embedded.  3. Inconsistent validation.  Because the
-                          usages are different, the validation rules are different
-                          by usage, which makes it hard for users to predict what
-                          will happen.  4. The fields are both imprecise and overly
-                          precise.  Kind is not a precise mapping to a URL. This can
-                          produce ambiguity     during interpretation and require
-                          a REST mapping.  In most cases, the dependency is on the
-                          group,resource tuple     and the version of the actual struct
-                          is irrelevant.  5. We cannot easily change it.  Because
+                          describing its usage when embedded in APIs. 1. Ignored fields.
+                          \ It includes many fields which are not generally honored.
+                          \ For instance, ResourceVersion and FieldPath are both very
+                          rarely valid in actual usage. 2. Invalid usage help.  It
+                          is impossible to add specific help for individual usage.
+                          \ In most embedded usages, there are particular restrictions
+                          like, \"must refer only to types A and B\" or \"UID not
+                          honored\" or \"name must be restricted\". Those cannot be
+                          well described when embedded. 3. Inconsistent validation.
+                          \ Because the usages are different, the validation rules
+                          are different by usage, which makes it hard for users to
+                          predict what will happen. 4. The fields are both imprecise
+                          and overly precise.  Kind is not a precise mapping to a
+                          URL. This can produce ambiguity during interpretation and
+                          require a REST mapping.  In most cases, the dependency is
+                          on the group,resource tuple and the version of the actual
+                          struct is irrelevant. 5. We cannot easily change it.  Because
                           this type is embedded in many locations, updates to this
-                          type     will affect numerous schemas.  Don''t make new
-                          APIs embed an underspecified API type they do not control.
+                          type will affect numerous schemas.  Don't make new APIs
+                          embed an underspecified API type they do not control. \n
                           Instead of using this type, create a locally provided and
                           used type that is well-focused on your reference. For example,
                           ServiceReferences for admission registration: https://github.com/kubernetes/api/blob/release-1.17/admissionregistration/v1/types.go#L533
-                          .'
+                          ."
                         properties:
                           apiVersion:
                             description: API version of the referent.
@@ -664,6 +667,7 @@ spec:
                             description: 'UID of the referent. More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#uids'
                             type: string
                         type: object
+                        x-kubernetes-map-type: atomic
                       type: array
                     traits:
                       items:
@@ -708,31 +712,31 @@ spec:
                   appRevision:
                     type: string
                   contextBackend:
-                    description: 'ObjectReference contains enough information to let
+                    description: "ObjectReference contains enough information to let
                       you inspect or modify the referred object. --- New uses of this
                       type are discouraged because of difficulty describing its usage
-                      when embedded in APIs.  1. Ignored fields.  It includes many
+                      when embedded in APIs. 1. Ignored fields.  It includes many
                       fields which are not generally honored.  For instance, ResourceVersion
-                      and FieldPath are both very rarely valid in actual usage.  2.
+                      and FieldPath are both very rarely valid in actual usage. 2.
                       Invalid usage help.  It is impossible to add specific help for
-                      individual usage.  In most embedded usages, there are particular     restrictions
-                      like, "must refer only to types A and B" or "UID not honored"
-                      or "name must be restricted".     Those cannot be well described
-                      when embedded.  3. Inconsistent validation.  Because the usages
-                      are different, the validation rules are different by usage,
-                      which makes it hard for users to predict what will happen.  4.
-                      The fields are both imprecise and overly precise.  Kind is not
-                      a precise mapping to a URL. This can produce ambiguity     during
-                      interpretation and require a REST mapping.  In most cases, the
-                      dependency is on the group,resource tuple     and the version
-                      of the actual struct is irrelevant.  5. We cannot easily change
+                      individual usage.  In most embedded usages, there are particular
+                      restrictions like, \"must refer only to types A and B\" or \"UID
+                      not honored\" or \"name must be restricted\". Those cannot be
+                      well described when embedded. 3. Inconsistent validation.  Because
+                      the usages are different, the validation rules are different
+                      by usage, which makes it hard for users to predict what will
+                      happen. 4. The fields are both imprecise and overly precise.
+                      \ Kind is not a precise mapping to a URL. This can produce ambiguity
+                      during interpretation and require a REST mapping.  In most cases,
+                      the dependency is on the group,resource tuple and the version
+                      of the actual struct is irrelevant. 5. We cannot easily change
                       it.  Because this type is embedded in many locations, updates
-                      to this type     will affect numerous schemas.  Don''t make
-                      new APIs embed an underspecified API type they do not control.
-                      Instead of using this type, create a locally provided and used
-                      type that is well-focused on your reference. For example, ServiceReferences
+                      to this type will affect numerous schemas.  Don't make new APIs
+                      embed an underspecified API type they do not control. \n Instead
+                      of using this type, create a locally provided and used type
+                      that is well-focused on your reference. For example, ServiceReferences
                       for admission registration: https://github.com/kubernetes/api/blob/release-1.17/admissionregistration/v1/types.go#L533
-                      .'
+                      ."
                     properties:
                       apiVersion:
                         description: API version of the referent.
@@ -767,15 +771,23 @@ spec:
                         description: 'UID of the referent. More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#uids'
                         type: string
                     type: object
+                    x-kubernetes-map-type: atomic
+                  endTime:
+                    format: date-time
+                    nullable: true
+                    type: string
                   finished:
                     type: boolean
                   message:
                     type: string
                   mode:
-                    description: WorkflowMode describes the mode of workflow
                     type: string
                   startTime:
                     format: date-time
+                    type: string
+                  status:
+                    description: WorkflowRunPhase is a label for the condition of
+                      a WorkflowRun at the current time
                     type: string
                   steps:
                     items:
@@ -810,8 +822,8 @@ spec:
                           type: string
                         subSteps:
                           items:
-                            description: WorkflowSubStepStatus record the status of
-                              a workflow subStep
+                            description: StepStatus record the base status of workflow
+                              step, which could be workflow step or subStep
                             properties:
                               firstExecuteTime:
                                 description: FirstExecuteTime is the first time this
@@ -922,6 +934,7 @@ spec:
                     inputs:
                       description: StepInputs defines variable input of WorkflowStep
                       items:
+                        description: InputItem defines an input variable of WorkflowStep
                         properties:
                           from:
                             type: string
@@ -929,7 +942,6 @@ spec:
                             type: string
                         required:
                         - from
-                        - parameterKey
                         type: object
                       type: array
                     name:
@@ -937,6 +949,7 @@ spec:
                     outputs:
                       description: StepOutputs defines output variable of WorkflowStep
                       items:
+                        description: OutputItem defines an output variable of WorkflowStep
                         properties:
                           name:
                             type: string
@@ -1010,6 +1023,17 @@ spec:
                   order, and each step: - will have a context in annotation. - should
                   mark "finish" phase in status.conditions.'
                 properties:
+                  mode:
+                    description: WorkflowExecuteMode defines the mode of workflow
+                      execution
+                    properties:
+                      steps:
+                        description: Steps is the mode of workflow steps execution
+                        type: string
+                      subSteps:
+                        description: SubSteps is the mode of workflow sub steps execution
+                        type: string
+                    type: object
                   ref:
                     type: string
                   steps:
@@ -1018,14 +1042,17 @@ spec:
                         step.
                       properties:
                         dependsOn:
+                          description: DependsOn is the dependency of the step
                           items:
                             type: string
                           type: array
                         if:
+                          description: If is the if condition of the step
                           type: string
                         inputs:
-                          description: StepInputs defines variable input of WorkflowStep
+                          description: Inputs is the inputs of the step
                           items:
+                            description: InputItem defines an input variable of WorkflowStep
                             properties:
                               from:
                                 type: string
@@ -1033,15 +1060,27 @@ spec:
                                 type: string
                             required:
                             - from
-                            - parameterKey
                             type: object
                           type: array
+                        meta:
+                          description: Meta is the meta data of the workflow step.
+                          properties:
+                            alias:
+                              type: string
+                          type: object
+                        mode:
+                          description: Mode is only valid for sub steps, it defines
+                            the mode of the sub steps
+                          nullable: true
+                          type: string
                         name:
                           description: Name is the unique name of the workflow step.
                           type: string
                         outputs:
-                          description: StepOutputs defines output variable of WorkflowStep
+                          description: Outputs is the outputs of the step
                           items:
+                            description: OutputItem defines an output variable of
+                              WorkflowStep
                             properties:
                               name:
                                 type: string
@@ -1053,23 +1092,27 @@ spec:
                             type: object
                           type: array
                         properties:
+                          description: Properties is the properties of the step
                           type: object
                           
                         subSteps:
                           items:
-                            description: WorkflowSubStep defines how to execute a
-                              workflow subStep.
+                            description: WorkflowStepBase defines the workflow step
+                              base
                             properties:
                               dependsOn:
+                                description: DependsOn is the dependency of the step
                                 items:
                                   type: string
                                 type: array
                               if:
+                                description: If is the if condition of the step
                                 type: string
                               inputs:
-                                description: StepInputs defines variable input of
-                                  WorkflowStep
+                                description: Inputs is the inputs of the step
                                 items:
+                                  description: InputItem defines an input variable
+                                    of WorkflowStep
                                   properties:
                                     from:
                                       type: string
@@ -1077,17 +1120,24 @@ spec:
                                       type: string
                                   required:
                                   - from
-                                  - parameterKey
                                   type: object
                                 type: array
+                              meta:
+                                description: Meta is the meta data of the workflow
+                                  step.
+                                properties:
+                                  alias:
+                                    type: string
+                                type: object
                               name:
                                 description: Name is the unique name of the workflow
                                   step.
                                 type: string
                               outputs:
-                                description: StepOutputs defines output variable of
-                                  WorkflowStep
+                                description: Outputs is the outputs of the step
                                 items:
+                                  description: OutputItem defines an output variable
+                                    of WorkflowStep
                                   properties:
                                     name:
                                       type: string
@@ -1099,23 +1149,26 @@ spec:
                                   type: object
                                 type: array
                               properties:
+                                description: Properties is the properties of the step
                                 type: object
                                 
                               timeout:
+                                description: Timeout is the timeout of the step
                                 type: string
                               type:
+                                description: Type is the type of the workflow step.
                                 type: string
                             required:
-                            - name
                             - type
                             type: object
                           type: array
                         timeout:
+                          description: Timeout is the timeout of the step
                           type: string
                         type:
+                          description: Type is the type of the workflow step.
                           type: string
                       required:
-                      - name
                       - type
                       type: object
                     type: array
@@ -1139,7 +1192,6 @@ spec:
                     cluster:
                       type: string
                     creator:
-                      description: ResourceCreatorRole defines the resource creator.
                       type: string
                     fieldPath:
                       description: 'If referring to a piece of an object instead of
@@ -1171,36 +1223,37 @@ spec:
                       description: 'UID of the referent. More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#uids'
                       type: string
                   type: object
+                  x-kubernetes-map-type: atomic
                 type: array
               components:
                 description: Components record the related Components created by Application
                   Controller
                 items:
-                  description: 'ObjectReference contains enough information to let
+                  description: "ObjectReference contains enough information to let
                     you inspect or modify the referred object. --- New uses of this
                     type are discouraged because of difficulty describing its usage
-                    when embedded in APIs.  1. Ignored fields.  It includes many fields
+                    when embedded in APIs. 1. Ignored fields.  It includes many fields
                     which are not generally honored.  For instance, ResourceVersion
-                    and FieldPath are both very rarely valid in actual usage.  2.
-                    Invalid usage help.  It is impossible to add specific help for
-                    individual usage.  In most embedded usages, there are particular     restrictions
-                    like, "must refer only to types A and B" or "UID not honored"
-                    or "name must be restricted".     Those cannot be well described
-                    when embedded.  3. Inconsistent validation.  Because the usages
+                    and FieldPath are both very rarely valid in actual usage. 2. Invalid
+                    usage help.  It is impossible to add specific help for individual
+                    usage.  In most embedded usages, there are particular restrictions
+                    like, \"must refer only to types A and B\" or \"UID not honored\"
+                    or \"name must be restricted\". Those cannot be well described
+                    when embedded. 3. Inconsistent validation.  Because the usages
                     are different, the validation rules are different by usage, which
-                    makes it hard for users to predict what will happen.  4. The fields
+                    makes it hard for users to predict what will happen. 4. The fields
                     are both imprecise and overly precise.  Kind is not a precise
-                    mapping to a URL. This can produce ambiguity     during interpretation
+                    mapping to a URL. This can produce ambiguity during interpretation
                     and require a REST mapping.  In most cases, the dependency is
-                    on the group,resource tuple     and the version of the actual
-                    struct is irrelevant.  5. We cannot easily change it.  Because
-                    this type is embedded in many locations, updates to this type     will
-                    affect numerous schemas.  Don''t make new APIs embed an underspecified
-                    API type they do not control. Instead of using this type, create
+                    on the group,resource tuple and the version of the actual struct
+                    is irrelevant. 5. We cannot easily change it.  Because this type
+                    is embedded in many locations, updates to this type will affect
+                    numerous schemas.  Don't make new APIs embed an underspecified
+                    API type they do not control. \n Instead of using this type, create
                     a locally provided and used type that is well-focused on your
                     reference. For example, ServiceReferences for admission registration:
                     https://github.com/kubernetes/api/blob/release-1.17/admissionregistration/v1/types.go#L533
-                    .'
+                    ."
                   properties:
                     apiVersion:
                       description: API version of the referent.
@@ -1235,6 +1288,7 @@ spec:
                       description: 'UID of the referent. More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#uids'
                       type: string
                   type: object
+                  x-kubernetes-map-type: atomic
                 type: array
               conditions:
                 description: Conditions of the resource.
@@ -1290,9 +1344,10 @@ spec:
                 format: int64
                 type: integer
               policy:
-                description: PolicyStatus records the status of policy
+                description: PolicyStatus records the status of policy Deprecated
+                  This field is only used by EnvBinding Policy which is deprecated.
                 items:
-                  description: PolicyStatus records the status of policy
+                  description: PolicyStatus records the status of policy Deprecated
                   properties:
                     name:
                       type: string
@@ -1326,33 +1381,33 @@ spec:
                       type: string
                     scopes:
                       items:
-                        description: 'ObjectReference contains enough information
+                        description: "ObjectReference contains enough information
                           to let you inspect or modify the referred object. --- New
                           uses of this type are discouraged because of difficulty
-                          describing its usage when embedded in APIs.  1. Ignored
-                          fields.  It includes many fields which are not generally
-                          honored.  For instance, ResourceVersion and FieldPath are
-                          both very rarely valid in actual usage.  2. Invalid usage
-                          help.  It is impossible to add specific help for individual
-                          usage.  In most embedded usages, there are particular     restrictions
-                          like, "must refer only to types A and B" or "UID not honored"
-                          or "name must be restricted".     Those cannot be well described
-                          when embedded.  3. Inconsistent validation.  Because the
-                          usages are different, the validation rules are different
-                          by usage, which makes it hard for users to predict what
-                          will happen.  4. The fields are both imprecise and overly
-                          precise.  Kind is not a precise mapping to a URL. This can
-                          produce ambiguity     during interpretation and require
-                          a REST mapping.  In most cases, the dependency is on the
-                          group,resource tuple     and the version of the actual struct
-                          is irrelevant.  5. We cannot easily change it.  Because
+                          describing its usage when embedded in APIs. 1. Ignored fields.
+                          \ It includes many fields which are not generally honored.
+                          \ For instance, ResourceVersion and FieldPath are both very
+                          rarely valid in actual usage. 2. Invalid usage help.  It
+                          is impossible to add specific help for individual usage.
+                          \ In most embedded usages, there are particular restrictions
+                          like, \"must refer only to types A and B\" or \"UID not
+                          honored\" or \"name must be restricted\". Those cannot be
+                          well described when embedded. 3. Inconsistent validation.
+                          \ Because the usages are different, the validation rules
+                          are different by usage, which makes it hard for users to
+                          predict what will happen. 4. The fields are both imprecise
+                          and overly precise.  Kind is not a precise mapping to a
+                          URL. This can produce ambiguity during interpretation and
+                          require a REST mapping.  In most cases, the dependency is
+                          on the group,resource tuple and the version of the actual
+                          struct is irrelevant. 5. We cannot easily change it.  Because
                           this type is embedded in many locations, updates to this
-                          type     will affect numerous schemas.  Don''t make new
-                          APIs embed an underspecified API type they do not control.
+                          type will affect numerous schemas.  Don't make new APIs
+                          embed an underspecified API type they do not control. \n
                           Instead of using this type, create a locally provided and
                           used type that is well-focused on your reference. For example,
                           ServiceReferences for admission registration: https://github.com/kubernetes/api/blob/release-1.17/admissionregistration/v1/types.go#L533
-                          .'
+                          ."
                         properties:
                           apiVersion:
                             description: API version of the referent.
@@ -1388,6 +1443,7 @@ spec:
                             description: 'UID of the referent. More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#uids'
                             type: string
                         type: object
+                        x-kubernetes-map-type: atomic
                       type: array
                     traits:
                       items:
@@ -1432,31 +1488,31 @@ spec:
                   appRevision:
                     type: string
                   contextBackend:
-                    description: 'ObjectReference contains enough information to let
+                    description: "ObjectReference contains enough information to let
                       you inspect or modify the referred object. --- New uses of this
                       type are discouraged because of difficulty describing its usage
-                      when embedded in APIs.  1. Ignored fields.  It includes many
+                      when embedded in APIs. 1. Ignored fields.  It includes many
                       fields which are not generally honored.  For instance, ResourceVersion
-                      and FieldPath are both very rarely valid in actual usage.  2.
+                      and FieldPath are both very rarely valid in actual usage. 2.
                       Invalid usage help.  It is impossible to add specific help for
-                      individual usage.  In most embedded usages, there are particular     restrictions
-                      like, "must refer only to types A and B" or "UID not honored"
-                      or "name must be restricted".     Those cannot be well described
-                      when embedded.  3. Inconsistent validation.  Because the usages
-                      are different, the validation rules are different by usage,
-                      which makes it hard for users to predict what will happen.  4.
-                      The fields are both imprecise and overly precise.  Kind is not
-                      a precise mapping to a URL. This can produce ambiguity     during
-                      interpretation and require a REST mapping.  In most cases, the
-                      dependency is on the group,resource tuple     and the version
-                      of the actual struct is irrelevant.  5. We cannot easily change
+                      individual usage.  In most embedded usages, there are particular
+                      restrictions like, \"must refer only to types A and B\" or \"UID
+                      not honored\" or \"name must be restricted\". Those cannot be
+                      well described when embedded. 3. Inconsistent validation.  Because
+                      the usages are different, the validation rules are different
+                      by usage, which makes it hard for users to predict what will
+                      happen. 4. The fields are both imprecise and overly precise.
+                      \ Kind is not a precise mapping to a URL. This can produce ambiguity
+                      during interpretation and require a REST mapping.  In most cases,
+                      the dependency is on the group,resource tuple and the version
+                      of the actual struct is irrelevant. 5. We cannot easily change
                       it.  Because this type is embedded in many locations, updates
-                      to this type     will affect numerous schemas.  Don''t make
-                      new APIs embed an underspecified API type they do not control.
-                      Instead of using this type, create a locally provided and used
-                      type that is well-focused on your reference. For example, ServiceReferences
+                      to this type will affect numerous schemas.  Don't make new APIs
+                      embed an underspecified API type they do not control. \n Instead
+                      of using this type, create a locally provided and used type
+                      that is well-focused on your reference. For example, ServiceReferences
                       for admission registration: https://github.com/kubernetes/api/blob/release-1.17/admissionregistration/v1/types.go#L533
-                      .'
+                      ."
                     properties:
                       apiVersion:
                         description: API version of the referent.
@@ -1491,15 +1547,23 @@ spec:
                         description: 'UID of the referent. More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#uids'
                         type: string
                     type: object
+                    x-kubernetes-map-type: atomic
+                  endTime:
+                    format: date-time
+                    nullable: true
+                    type: string
                   finished:
                     type: boolean
                   message:
                     type: string
                   mode:
-                    description: WorkflowMode describes the mode of workflow
                     type: string
                   startTime:
                     format: date-time
+                    type: string
+                  status:
+                    description: WorkflowRunPhase is a label for the condition of
+                      a WorkflowRun at the current time
                     type: string
                   steps:
                     items:
@@ -1534,8 +1598,8 @@ spec:
                           type: string
                         subSteps:
                           items:
-                            description: WorkflowSubStepStatus record the status of
-                              a workflow subStep
+                            description: StepStatus record the base status of workflow
+                              step, which could be workflow step or subStep
                             properties:
                               firstExecuteTime:
                                 description: FirstExecuteTime is the first time this
@@ -1593,9 +1657,3 @@ spec:
     storage: true
     subresources:
       status: {}
-status:
-  acceptedNames:
-    kind: ""
-    plural: ""
-  conditions: []
-  storedVersions: []

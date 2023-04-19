@@ -31,8 +31,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 
-	"github.com/oam-dev/kubevela/pkg/apiserver/infrastructure/clients"
-	"github.com/oam-dev/kubevela/pkg/cue/packages"
+	"github.com/kubevela/workflow/pkg/cue/packages"
+
 	"github.com/oam-dev/kubevela/pkg/oam/discoverymapper"
 	"github.com/oam-dev/kubevela/pkg/utils/common"
 )
@@ -52,7 +52,7 @@ var _ = BeforeSuite(func(done Done) {
 	testEnv = &envtest.Environment{
 		ControlPlaneStartTimeout: time.Minute * 3,
 		ControlPlaneStopTimeout:  time.Minute,
-		UseExistingCluster:       pointer.BoolPtr(false),
+		UseExistingCluster:       pointer.Bool(false),
 		CRDDirectoryPaths:        []string{"../../charts/vela-core/crds"},
 	}
 
@@ -68,7 +68,6 @@ var _ = BeforeSuite(func(done Done) {
 	Expect(err).Should(BeNil())
 	Expect(k8sClient).ToNot(BeNil())
 	By("new kube client success")
-	clients.SetKubeClient(k8sClient)
 
 	dm, err := discoverymapper.New(cfg)
 	Expect(err).To(BeNil())

@@ -25,8 +25,10 @@ import (
 	gov "github.com/hashicorp/go-version"
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 	"sigs.k8s.io/controller-runtime/pkg/client/config"
+
+	workflowv1alpha1 "github.com/kubevela/workflow/api/v1alpha1"
 
 	"github.com/oam-dev/kubevela/apis/types"
 	velacmd "github.com/oam-dev/kubevela/pkg/cmd"
@@ -68,8 +70,13 @@ func NewCommandWithIOStreams(ioStream util.IOStreams) *cobra.Command {
 		},
 	}
 
+	scheme := common.Scheme
+	err := workflowv1alpha1.AddToScheme(scheme)
+	if err != nil {
+		klog.Fatal(err)
+	}
 	commandArgs := common.Args{
-		Schema: common.Scheme,
+		Schema: scheme,
 	}
 	f := velacmd.NewDeferredFactory(config.GetConfig)
 
@@ -86,20 +93,22 @@ func NewCommandWithIOStreams(ioStream util.IOStreams) *cobra.Command {
 		NewCapabilityShowCommand(commandArgs, ioStream),
 
 		// Manage Apps
-		NewQlCommand(commandArgs, "10", ioStream),
-		NewListCommand(commandArgs, "9", ioStream),
-		NewAppStatusCommand(commandArgs, "8", ioStream),
-		NewDeleteCommand(commandArgs, "7", ioStream),
+		NewTopCommand(commandArgs, "11", ioStream),
+		NewListCommand(commandArgs, "10", ioStream),
+		NewAppStatusCommand(commandArgs, "9", ioStream),
+		NewDeleteCommand(f, "7"),
 		NewExecCommand(commandArgs, "6", ioStream),
 		NewPortForwardCommand(commandArgs, "5", ioStream),
 		NewLogsCommand(commandArgs, "4", ioStream),
-		NewLiveDiffCommand(commandArgs, "3", ioStream),
+		NewQlCommand(commandArgs, "3", ioStream),
+		NewLiveDiffCommand(commandArgs, "2", ioStream),
 		NewDryRunCommand(commandArgs, ioStream),
 		RevisionCommandGroup(commandArgs),
+		NewAdoptCommand(f, ioStream),
 
 		// Workflows
 		NewWorkflowCommand(commandArgs, ioStream),
-		ClusterCommandGroup(commandArgs, ioStream),
+		ClusterCommandGroup(f, commandArgs, ioStream),
 
 		// Debug
 		NewDebugCommand(commandArgs, ioStream),
@@ -107,7 +116,7 @@ func NewCommandWithIOStreams(ioStream util.IOStreams) *cobra.Command {
 		// Extension
 		NewAddonCommand(commandArgs, "9", ioStream),
 		NewUISchemaCommand(commandArgs, "8", ioStream),
-		DefinitionCommandGroup(commandArgs, "7"),
+		DefinitionCommandGroup(commandArgs, "7", ioStream),
 		NewRegistryCommand(ioStream, "6"),
 		NewTraitCommand(commandArgs, ioStream),
 		NewComponentsCommand(commandArgs, ioStream),
@@ -115,19 +124,22 @@ func NewCommandWithIOStreams(ioStream util.IOStreams) *cobra.Command {
 		AuthCommandGroup(f, ioStream),
 		KubeCommandGroup(f, ioStream),
 
+		// Config management
+		ConfigCommandGroup(f, ioStream),
+		TemplateCommandGroup(f, ioStream),
+
 		// System
 		NewInstallCommand(commandArgs, "1", ioStream),
 		NewUnInstallCommand(commandArgs, "2", ioStream),
 		NewExportCommand(commandArgs, ioStream),
-		NewCUEPackageCommand(commandArgs, ioStream),
 		NewVersionCommand(ioStream),
 		NewCompletionCommand(),
+		NewSystemCommand(commandArgs),
 
 		// helper
 		NewHelpCommand(),
 
 		// hide
-		NewTemplateCommand(ioStream),
 		NewWorkloadsCommand(commandArgs, ioStream),
 	)
 

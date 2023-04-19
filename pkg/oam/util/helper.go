@@ -46,15 +46,9 @@ import (
 	"github.com/oam-dev/kubevela/apis/core.oam.dev/condition"
 	"github.com/oam-dev/kubevela/apis/core.oam.dev/v1alpha2"
 	"github.com/oam-dev/kubevela/apis/core.oam.dev/v1beta1"
+	types2 "github.com/oam-dev/kubevela/apis/types"
 	"github.com/oam-dev/kubevela/pkg/oam"
 	"github.com/oam-dev/kubevela/pkg/oam/discoverymapper"
-)
-
-var (
-	// KindDeployment is the k8s Deployment kind.
-	KindDeployment = reflect.TypeOf(appsv1.Deployment{}).Name()
-	// KindService is the k8s Service kind.
-	KindService = reflect.TypeOf(corev1.Service{}).Name()
 )
 
 const (
@@ -280,11 +274,11 @@ func FetchWorkloadDefinition(ctx context.Context, r client.Reader, dm discoverym
 }
 
 // GetDefinitionNamespaceWithCtx will get namespace from context, it will try get `AppDefinitionNamespace` key, if not found,
-// will use default system level namespace defined in `systemvar.SystemDefinitonNamespace`
+// will use default system level namespace defined in `systemvar.SystemDefinitionNamespace`
 func GetDefinitionNamespaceWithCtx(ctx context.Context) string {
 	var appNs string
 	if app := ctx.Value(AppDefinitionNamespace); app == nil {
-		appNs = oam.SystemDefinitonNamespace
+		appNs = oam.SystemDefinitionNamespace
 	} else {
 		appNs = app.(string)
 	}
@@ -297,7 +291,7 @@ func GetDefinitionNamespaceWithCtx(ctx context.Context) string {
 func SetNamespaceInCtx(ctx context.Context, namespace string) context.Context {
 	if namespace == "" {
 		// compatible with some webhook handlers that maybe receive empty string as app namespace which means `default` namespace
-		namespace = "default"
+		namespace = types2.DefaultAppNamespace
 	}
 	ctx = context.WithValue(ctx, AppDefinitionNamespace, namespace)
 	return ctx
@@ -308,7 +302,7 @@ func GetDefinition(ctx context.Context, cli client.Reader, definition client.Obj
 	appNs := GetDefinitionNamespaceWithCtx(ctx)
 	if err := cli.Get(ctx, types.NamespacedName{Name: definitionName, Namespace: appNs}, definition); err != nil {
 		if apierrors.IsNotFound(err) {
-			if err = cli.Get(ctx, types.NamespacedName{Name: definitionName, Namespace: oam.SystemDefinitonNamespace}, definition); err != nil {
+			if err = cli.Get(ctx, types.NamespacedName{Name: definitionName, Namespace: oam.SystemDefinitionNamespace}, definition); err != nil {
 				if apierrors.IsNotFound(err) {
 					// compatibility code for old clusters those definition crd is cluster scope
 					var newErr error
@@ -869,28 +863,6 @@ func MergeMapOverrideWithDst(src, dst map[string]string) map[string]string {
 	return r
 }
 
-// ConvertComponentDef2WorkloadDef help convert a ComponentDefinition to WorkloadDefinition
-func ConvertComponentDef2WorkloadDef(dm discoverymapper.DiscoveryMapper, componentDef *v1beta1.ComponentDefinition,
-	workloadDef *v1beta1.WorkloadDefinition) error {
-	var reference common.DefinitionReference
-	reference, err := ConvertWorkloadGVK2Definition(dm, componentDef.Spec.Workload.Definition)
-	if err != nil {
-		return fmt.Errorf("create DefinitionReference fail %w", err)
-	}
-
-	workloadDef.SetName(componentDef.Name)
-	workloadDef.SetNamespace(componentDef.Namespace)
-	workloadDef.SetLabels(componentDef.Labels)
-	workloadDef.SetAnnotations(componentDef.Annotations)
-	workloadDef.Spec.Reference = reference
-	workloadDef.Spec.ChildResourceKinds = componentDef.Spec.ChildResourceKinds
-	workloadDef.Spec.Extension = componentDef.Spec.Extension
-	workloadDef.Spec.RevisionLabel = componentDef.Spec.RevisionLabel
-	workloadDef.Spec.Status = componentDef.Spec.Status
-	workloadDef.Spec.Schematic = componentDef.Spec.Schematic
-	return nil
-}
-
 // ExtractComponentName will extract the componentName from a revisionName
 func ExtractComponentName(revisionName string) string {
 	splits := strings.Split(revisionName, "-")
@@ -952,4 +924,39 @@ func AsController(r *corev1.ObjectReference) metav1.OwnerReference {
 	ref := AsOwner(r)
 	ref.Controller = &c
 	return ref
+}
+
+// NamespaceAccessor namespace accessor for resource
+type NamespaceAccessor interface {
+	For(obj client.Object) string
+	Namespace() string
+}
+
+type applicationResourceNamespaceAccessor struct {
+	applicationNamespace string
+	overrideNamespace    string
+}
+
+// For access namespace for resource
+func (accessor *applicationResourceNamespaceAccessor) For(obj client.Object) string {
+	if accessor.overrideNamespace != "" {
+		return accessor.overrideNamespace
+	}
+	if originalNamespace := obj.GetNamespace(); originalNamespace != "" {
+		return originalNamespace
+	}
+	return accessor.applicationNamespace
+}
+
+// Namespace the namespace by default
+func (accessor *applicationResourceNamespaceAccessor) Namespace() string {
+	if accessor.overrideNamespace != "" {
+		return accessor.overrideNamespace
+	}
+	return accessor.applicationNamespace
+}
+
+// NewApplicationResourceNamespaceAccessor create namespace accessor for resource in application
+func NewApplicationResourceNamespaceAccessor(appNs, overrideNs string) NamespaceAccessor {
+	return &applicationResourceNamespaceAccessor{applicationNamespace: appNs, overrideNamespace: overrideNs}
 }

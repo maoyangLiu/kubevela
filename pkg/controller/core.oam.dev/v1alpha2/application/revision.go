@@ -22,7 +22,10 @@ import (
 	"reflect"
 	"sort"
 	"strings"
+	"time"
 
+	"github.com/hashicorp/go-version"
+	"github.com/kubevela/pkg/util/k8s"
 	"github.com/pkg/errors"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -31,9 +34,16 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	ktypes "k8s.io/apimachinery/pkg/types"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/klog/v2"
 	"k8s.io/utils/pointer"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	"github.com/kubevela/pkg/util/compression"
+
+	"github.com/kubevela/pkg/controller/sharding"
+	monitorContext "github.com/kubevela/pkg/monitor/context"
+	workflowv1alpha1 "github.com/kubevela/workflow/api/v1alpha1"
 
 	"github.com/oam-dev/kubevela/apis/core.oam.dev/common"
 	"github.com/oam-dev/kubevela/apis/core.oam.dev/v1alpha1"
@@ -43,18 +53,20 @@ import (
 	"github.com/oam-dev/kubevela/pkg/appfile"
 	helmapi "github.com/oam-dev/kubevela/pkg/appfile/helm/flux2apis"
 	"github.com/oam-dev/kubevela/pkg/auth"
+	"github.com/oam-dev/kubevela/pkg/cache"
 	"github.com/oam-dev/kubevela/pkg/component"
 	"github.com/oam-dev/kubevela/pkg/controller/utils"
-	"github.com/oam-dev/kubevela/pkg/cue/model"
-	monitorContext "github.com/oam-dev/kubevela/pkg/monitor/context"
+	"github.com/oam-dev/kubevela/pkg/cue/process"
+	"github.com/oam-dev/kubevela/pkg/features"
 	"github.com/oam-dev/kubevela/pkg/monitor/metrics"
 	"github.com/oam-dev/kubevela/pkg/multicluster"
 	"github.com/oam-dev/kubevela/pkg/oam"
 	"github.com/oam-dev/kubevela/pkg/oam/util"
 	"github.com/oam-dev/kubevela/pkg/policy/envbinding"
+	pkgutils "github.com/oam-dev/kubevela/pkg/utils"
 )
 
-type contextKey string
+type contextKey int
 
 const (
 	// ConfigMapKeyComponents is the key in ConfigMap Data field for containing data of components
@@ -67,9 +79,32 @@ const (
 	ManifestKeyTraits = "Traits"
 	// ManifestKeyScopes is the key in Component Manifest for containing scope cr reference.
 	ManifestKeyScopes = "Scopes"
-	// ComponentRevisionNamespaceContextKey is the key in context that defines the override namespace of component revision
-	ComponentRevisionNamespaceContextKey = contextKey("component-revision-namespace")
 )
+
+const rolloutTraitName = "rollout"
+
+// contextWithComponent records ApplicationComponent in context
+func contextWithComponent(ctx context.Context, component *common.ApplicationComponent) context.Context {
+	return context.WithValue(ctx, ComponentContextKey, component)
+}
+
+// componentInContext extract ApplicationComponent from context
+func componentInContext(ctx context.Context) *common.ApplicationComponent {
+	comp, _ := ctx.Value(ComponentContextKey).(*common.ApplicationComponent)
+	return comp
+}
+
+func _containsRolloutTrait(ctx context.Context) bool {
+	comp := componentInContext(ctx)
+	if comp != nil {
+		for _, trait := range comp.Traits {
+			if trait.Type == rolloutTraitName {
+				return true
+			}
+		}
+	}
+	return false
+}
 
 var (
 	// DisableAllComponentRevision disable component revision creation
@@ -78,12 +113,26 @@ var (
 	DisableAllApplicationRevision = false
 )
 
-func contextWithComponentRevisionNamespace(ctx context.Context, ns string) context.Context {
-	return context.WithValue(ctx, ComponentRevisionNamespaceContextKey, ns)
+func contextWithComponentNamespace(ctx context.Context, ns string) context.Context {
+	return context.WithValue(ctx, ComponentNamespaceContextKey, ns)
+}
+
+func componentNamespaceFromContext(ctx context.Context) string {
+	ns, _ := ctx.Value(ComponentNamespaceContextKey).(string)
+	return ns
+}
+
+func contextWithReplicaKey(ctx context.Context, key string) context.Context {
+	return context.WithValue(ctx, ReplicaKeyContextKey, key)
+}
+
+func replicaKeyFromContext(ctx context.Context) string {
+	key, _ := ctx.Value(ReplicaKeyContextKey).(string)
+	return key
 }
 
 func (h *AppHandler) getComponentRevisionNamespace(ctx context.Context) string {
-	if ns, ok := ctx.Value(ComponentRevisionNamespaceContextKey).(string); ok && ns != "" {
+	if ns, ok := ctx.Value(ComponentNamespaceContextKey).(string); ok && ns != "" {
 		return ns
 	}
 	return h.app.Namespace
@@ -153,7 +202,7 @@ func SprintComponentManifest(cm *types.ComponentManifest) string {
 func (h *AppHandler) PrepareCurrentAppRevision(ctx context.Context, af *appfile.Appfile) error {
 	if ctx, ok := ctx.(monitorContext.Context); ok {
 		subCtx := ctx.Fork("prepare-current-appRevision", monitorContext.DurationMetric(func(v float64) {
-			metrics.PrepareCurrentAppRevisionDurationHistogram.WithLabelValues("application").Observe(v)
+			metrics.AppReconcileStageDurationHistogram.WithLabelValues("prepare-current-apprev").Observe(v)
 		}))
 		defer subCtx.Commit("finish prepare current appRevision")
 	}
@@ -198,20 +247,19 @@ func (h *AppHandler) gatherRevisionSpec(af *appfile.Appfile) (*v1beta1.Applicati
 	copiedApp := h.app.DeepCopy()
 	// We better to remove all object status in the appRevision
 	copiedApp.Status = common.AppStatus{}
-	if !metav1.HasAnnotation(h.app.ObjectMeta, oam.AnnotationPublishVersion) {
-		copiedApp.Spec.Workflow = nil
-	}
 	appRev := &v1beta1.ApplicationRevision{
 		Spec: v1beta1.ApplicationRevisionSpec{
-			Application:             *copiedApp,
-			ComponentDefinitions:    make(map[string]v1beta1.ComponentDefinition),
-			WorkloadDefinitions:     make(map[string]v1beta1.WorkloadDefinition),
-			TraitDefinitions:        make(map[string]v1beta1.TraitDefinition),
-			ScopeDefinitions:        make(map[string]v1beta1.ScopeDefinition),
-			PolicyDefinitions:       make(map[string]v1beta1.PolicyDefinition),
-			WorkflowStepDefinitions: make(map[string]v1beta1.WorkflowStepDefinition),
-			ScopeGVK:                make(map[string]metav1.GroupVersionKind),
-			Policies:                make(map[string]v1alpha1.Policy),
+			ApplicationRevisionCompressibleFields: v1beta1.ApplicationRevisionCompressibleFields{
+				Application:             *copiedApp,
+				ComponentDefinitions:    make(map[string]*v1beta1.ComponentDefinition),
+				WorkloadDefinitions:     make(map[string]v1beta1.WorkloadDefinition),
+				TraitDefinitions:        make(map[string]*v1beta1.TraitDefinition),
+				ScopeDefinitions:        make(map[string]v1beta1.ScopeDefinition),
+				PolicyDefinitions:       make(map[string]v1beta1.PolicyDefinition),
+				WorkflowStepDefinitions: make(map[string]*v1beta1.WorkflowStepDefinition),
+				ScopeGVK:                make(map[string]metav1.GroupVersionKind),
+				Policies:                make(map[string]v1alpha1.Policy),
+			},
 		},
 	}
 	for _, w := range af.Workloads {
@@ -221,7 +269,7 @@ func (h *AppHandler) gatherRevisionSpec(af *appfile.Appfile) (*v1beta1.Applicati
 		if w.FullTemplate.ComponentDefinition != nil {
 			cd := w.FullTemplate.ComponentDefinition.DeepCopy()
 			cd.Status = v1beta1.ComponentDefinitionStatus{}
-			appRev.Spec.ComponentDefinitions[w.FullTemplate.ComponentDefinition.Name] = *cd
+			appRev.Spec.ComponentDefinitions[w.FullTemplate.ComponentDefinition.Name] = cd.DeepCopy()
 		}
 		if w.FullTemplate.WorkloadDefinition != nil {
 			wd := w.FullTemplate.WorkloadDefinition.DeepCopy()
@@ -235,7 +283,7 @@ func (h *AppHandler) gatherRevisionSpec(af *appfile.Appfile) (*v1beta1.Applicati
 			if t.FullTemplate.TraitDefinition != nil {
 				td := t.FullTemplate.TraitDefinition.DeepCopy()
 				td.Status = v1beta1.TraitDefinitionStatus{}
-				appRev.Spec.TraitDefinitions[t.FullTemplate.TraitDefinition.Name] = *td
+				appRev.Spec.TraitDefinitions[t.FullTemplate.TraitDefinition.Name] = td.DeepCopy()
 			}
 		}
 		for _, s := range w.ScopeDefinition {
@@ -259,13 +307,13 @@ func (h *AppHandler) gatherRevisionSpec(af *appfile.Appfile) (*v1beta1.Applicati
 		}
 	}
 	for name, def := range af.RelatedComponentDefinitions {
-		appRev.Spec.ComponentDefinitions[name] = *def
+		appRev.Spec.ComponentDefinitions[name] = def.DeepCopy()
 	}
 	for name, def := range af.RelatedTraitDefinitions {
-		appRev.Spec.TraitDefinitions[name] = *def
+		appRev.Spec.TraitDefinitions[name] = def.DeepCopy()
 	}
 	for name, def := range af.RelatedWorkflowStepDefinitions {
-		appRev.Spec.WorkflowStepDefinitions[name] = *def
+		appRev.Spec.WorkflowStepDefinitions[name] = def.DeepCopy()
 	}
 	for name, po := range af.ExternalPolicies {
 		appRev.Spec.Policies[name] = *po
@@ -326,7 +374,7 @@ func ComputeAppRevisionHash(appRevision *v1beta1.ApplicationRevision) (string, e
 		PolicyHash:                 make(map[string]string),
 	}
 	var err error
-	revHash.ApplicationSpecHash, err = utils.ComputeSpecHash(filterSkipAffectAppRevTrait(appRevision.Spec.Application.Spec, appRevision.Spec.TraitDefinitions))
+	revHash.ApplicationSpecHash, err = utils.ComputeSpecHash(appRevision.Spec.Application.Spec)
 	if err != nil {
 		return "", err
 	}
@@ -344,7 +392,7 @@ func ComputeAppRevisionHash(appRevision *v1beta1.ApplicationRevision) (string, e
 		}
 		revHash.ComponentDefinitionHash[key] = hash
 	}
-	for key, td := range filterSkipAffectAppRevTraitDefinitions(appRevision.Spec.TraitDefinitions) {
+	for key, td := range appRevision.Spec.TraitDefinitions {
 		hash, err := utils.ComputeSpecHash(&td.Spec)
 		if err != nil {
 			return "", err
@@ -448,8 +496,8 @@ func DeepEqualRevision(old, new *v1beta1.ApplicationRevision) bool {
 	if len(old.Spec.WorkloadDefinitions) != len(new.Spec.WorkloadDefinitions) {
 		return false
 	}
-	oldTraitDefinitions := filterSkipAffectAppRevTraitDefinitions(old.Spec.TraitDefinitions)
-	newTraitDefinitions := filterSkipAffectAppRevTraitDefinitions(new.Spec.TraitDefinitions)
+	oldTraitDefinitions := old.Spec.TraitDefinitions
+	newTraitDefinitions := new.Spec.TraitDefinitions
 	if len(oldTraitDefinitions) != len(newTraitDefinitions) {
 		return false
 	}
@@ -486,8 +534,27 @@ func deepEqualPolicy(old, new v1alpha1.Policy) bool {
 	return old.Type == new.Type && apiequality.Semantic.DeepEqual(old.Properties, new.Properties)
 }
 
-func deepEqualWorkflow(old, new v1alpha1.Workflow) bool {
+func deepEqualWorkflow(old, new workflowv1alpha1.Workflow) bool {
 	return apiequality.Semantic.DeepEqual(old.Steps, new.Steps)
+}
+
+const velaVersionNumberToCompareWorkflow = "v1.5.7"
+
+func deepEqualAppSpec(old, new *v1beta1.Application) bool {
+	oldSpec, newSpec := old.Spec.DeepCopy(), new.Spec.DeepCopy()
+	// legacy code: KubeVela version before v1.5.7 & v1.6.0-alpha.4 does not
+	// record workflow in application spec in application revision. The comparison
+	// need to bypass the equality check of workflow to prevent unintended rerun
+	curVerNum := k8s.GetAnnotation(old, oam.AnnotationKubeVelaVersion)
+	publishVersion := k8s.GetAnnotation(old, oam.AnnotationPublishVersion)
+	if publishVersion == "" && curVerNum != "" {
+		cmpVer, _ := version.NewVersion(velaVersionNumberToCompareWorkflow)
+		if curVer, err := version.NewVersion(curVerNum); err == nil && curVer.LessThan(cmpVer) {
+			oldSpec.Workflow = nil
+			newSpec.Workflow = nil
+		}
+	}
+	return apiequality.Semantic.DeepEqual(oldSpec, newSpec)
 }
 
 func deepEqualAppInRevision(old, new *v1beta1.ApplicationRevision) bool {
@@ -507,8 +574,7 @@ func deepEqualAppInRevision(old, new *v1beta1.ApplicationRevision) bool {
 			return false
 		}
 	}
-	return apiequality.Semantic.DeepEqual(filterSkipAffectAppRevTrait(old.Spec.Application.Spec, old.Spec.TraitDefinitions),
-		filterSkipAffectAppRevTrait(new.Spec.Application.Spec, new.Spec.TraitDefinitions))
+	return deepEqualAppSpec(&old.Spec.Application, &new.Spec.Application)
 }
 
 // HandleComponentsRevision manages Component revisions
@@ -591,7 +657,7 @@ func (h *AppHandler) handleComponentRevisionNameUnspecified(ctx context.Context,
 
 	crList := &appsv1.ControllerRevisionList{}
 	listOpts := []client.ListOption{client.MatchingLabels{
-		oam.LabelControllerRevisionComponent: comp.Name,
+		oam.LabelControllerRevisionComponent: pkgutils.EscapeResourceNameToLabelValue(comp.Name),
 	}, client.InNamespace(h.getComponentRevisionNamespace(ctx))}
 	if err := h.r.List(auth.ContextWithUserInfo(ctx, h.app), crList, listOpts...); err != nil {
 		return err
@@ -698,10 +764,10 @@ func (h *AppHandler) createControllerRevision(ctx context.Context, cm *types.Com
 			Name:      cm.RevisionName,
 			Namespace: h.getComponentRevisionNamespace(ctx),
 			Labels: map[string]string{
-				oam.LabelAppComponent:                cm.Name,
+				oam.LabelAppComponent:                pkgutils.EscapeResourceNameToLabelValue(cm.Name),
 				oam.LabelAppCluster:                  multicluster.ClusterNameInContext(ctx),
 				oam.LabelAppEnv:                      envbinding.EnvNameInContext(ctx),
-				oam.LabelControllerRevisionComponent: cm.Name,
+				oam.LabelControllerRevisionComponent: pkgutils.EscapeResourceNameToLabelValue(cm.Name),
 				oam.LabelComponentRevisionHash:       cm.RevisionHash,
 			},
 		},
@@ -709,6 +775,9 @@ func (h *AppHandler) createControllerRevision(ctx context.Context, cm *types.Com
 		Data:     *util.Object2RawExtension(comp),
 	}
 	common.NewOAMObjectReferenceFromObject(cm.StandardWorkload).AddLabelsToObject(cr)
+	if !utilfeature.DefaultMutableFeatureGate.Enabled(features.LegacyComponentRevision) && !_containsRolloutTrait(ctx) {
+		return nil
+	}
 	return h.resourceKeeper.DispatchComponentRevision(ctx, cr)
 }
 
@@ -749,7 +818,7 @@ func (h *AppHandler) FinalizeAndApplyAppRevision(ctx context.Context) error {
 
 	if ctx, ok := ctx.(monitorContext.Context); ok {
 		subCtx := ctx.Fork("apply-app-revision", monitorContext.DurationMetric(func(v float64) {
-			metrics.ApplyAppRevisionDurationHistogram.WithLabelValues("application").Observe(v)
+			metrics.AppReconcileStageDurationHistogram.WithLabelValues("apply-apprev").Observe(v)
 		}))
 		defer subCtx.Commit("finish apply app revision")
 	}
@@ -770,8 +839,9 @@ func (h *AppHandler) FinalizeAndApplyAppRevision(ctx context.Context) error {
 		Kind:       v1beta1.ApplicationKind,
 		Name:       h.app.Name,
 		UID:        h.app.UID,
-		Controller: pointer.BoolPtr(true),
+		Controller: pointer.Bool(true),
 	}})
+	sharding.PropagateScheduledShardIDLabel(h.app, appRev)
 
 	gotAppRev := &v1beta1.ApplicationRevision{}
 	if err := h.r.Get(ctx, client.ObjectKey{Name: appRev.Name, Namespace: appRev.Namespace}, gotAppRev); err != nil {
@@ -780,7 +850,21 @@ func (h *AppHandler) FinalizeAndApplyAppRevision(ctx context.Context) error {
 		}
 		return err
 	}
+	if apiequality.Semantic.DeepEqual(gotAppRev.Spec, appRev.Spec) &&
+		apiequality.Semantic.DeepEqual(gotAppRev.GetLabels(), appRev.GetLabels()) &&
+		apiequality.Semantic.DeepEqual(gotAppRev.GetAnnotations(), appRev.GetAnnotations()) {
+		return nil
+	}
 	appRev.ResourceVersion = gotAppRev.ResourceVersion
+
+	// Set compression types (if enabled)
+	if utilfeature.DefaultMutableFeatureGate.Enabled(features.GzipApplicationRevision) {
+		appRev.Spec.Compression.SetType(compression.Gzip)
+	}
+	if utilfeature.DefaultMutableFeatureGate.Enabled(features.ZstdApplicationRevision) {
+		appRev.Spec.Compression.SetType(compression.Zstd)
+	}
+
 	return h.r.Update(ctx, appRev)
 }
 
@@ -793,6 +877,12 @@ func (h *AppHandler) UpdateAppLatestRevisionStatus(ctx context.Context) error {
 	if !h.isNewRevision {
 		// skip update if app revision is not changed
 		return nil
+	}
+	if ctx, ok := ctx.(monitorContext.Context); ok {
+		subCtx := ctx.Fork("update-apprev-status", monitorContext.DurationMetric(func(v float64) {
+			metrics.AppReconcileStageDurationHistogram.WithLabelValues("update-apprev-status").Observe(v)
+		}))
+		defer subCtx.Commit("application revision status updated")
 	}
 	revName := h.currentAppRev.Name
 	revNum, _ := util.ExtractRevisionNum(revName, "-")
@@ -816,6 +906,10 @@ func cleanUpApplicationRevision(ctx context.Context, h *AppHandler) error {
 	if DisableAllApplicationRevision {
 		return nil
 	}
+	t := time.Now()
+	defer func() {
+		metrics.AppReconcileStageDurationHistogram.WithLabelValues("gc-rev.apprev").Observe(time.Since(t).Seconds())
+	}()
 	sortedRevision, err := GetSortedAppRevisions(ctx, h.r.Client, h.app.Name, h.app.Namespace)
 	if err != nil {
 		return err
@@ -855,8 +949,8 @@ func gatherUsingAppRevision(h *AppHandler) map[string]bool {
 
 func replaceComponentRevisionContext(u *unstructured.Unstructured, compRevName string) error {
 	str := string(util.JSONMarshal(u))
-	if strings.Contains(str, model.ComponentRevisionPlaceHolder) {
-		newStr := strings.ReplaceAll(str, model.ComponentRevisionPlaceHolder, compRevName)
+	if strings.Contains(str, process.ComponentRevisionPlaceHolder) {
+		newStr := strings.ReplaceAll(str, process.ComponentRevisionPlaceHolder, compRevName)
 		if err := json.Unmarshal([]byte(newStr), u); err != nil {
 			return err
 		}
@@ -864,38 +958,14 @@ func replaceComponentRevisionContext(u *unstructured.Unstructured, compRevName s
 	return nil
 }
 
-// before computing hash or deepEqual, filterSkipAffectAppRevTrait filter can remove `SkipAffectAppRevTrait` trait from appSpec
-func filterSkipAffectAppRevTrait(appSpec v1beta1.ApplicationSpec, tds map[string]v1beta1.TraitDefinition) v1beta1.ApplicationSpec {
-	// deepCopy avoid modify origin appSpec
-	res := appSpec.DeepCopy()
-	for index, comp := range res.Components {
-		i := 0
-		for _, trait := range comp.Traits {
-			if !tds[trait.Type].Spec.SkipRevisionAffect {
-				comp.Traits[i] = trait
-				i++
-			}
-		}
-		res.Components[index].Traits = res.Components[index].Traits[:i]
-	}
-	return *res
-}
-
-// before computing hash or deepEqual, filterSkipAffectAppRevTraitDefinitions filter can ignore `SkipAffectRevision` trait definition from appRev
-func filterSkipAffectAppRevTraitDefinitions(tds map[string]v1beta1.TraitDefinition) map[string]v1beta1.TraitDefinition {
-	res := make(map[string]v1beta1.TraitDefinition)
-	for key, td := range tds {
-		if !td.Spec.SkipRevisionAffect {
-			res[key] = td
-		}
-	}
-	return res
-}
-
 func cleanUpWorkflowComponentRevision(ctx context.Context, h *AppHandler) error {
 	if DisableAllComponentRevision {
 		return nil
 	}
+	t := time.Now()
+	defer func() {
+		metrics.AppReconcileStageDurationHistogram.WithLabelValues("gc-rev.comprev").Observe(time.Since(t).Seconds())
+	}()
 	// collect component revision in use
 	compRevisionInUse := map[string]map[string]struct{}{}
 	ctx = auth.ContextWithUserInfo(ctx, h.app)
@@ -925,7 +995,7 @@ func cleanUpWorkflowComponentRevision(ctx context.Context, h *AppHandler) error 
 	for _, curComp := range h.app.Status.AppliedResources {
 		crList := &appsv1.ControllerRevisionList{}
 		listOpts := []client.ListOption{client.MatchingLabels{
-			oam.LabelControllerRevisionComponent: curComp.Name,
+			oam.LabelControllerRevisionComponent: pkgutils.EscapeResourceNameToLabelValue(curComp.Name),
 		}, client.InNamespace(h.getComponentRevisionNamespace(ctx))}
 		_ctx := multicluster.ContextWithClusterName(ctx, curComp.Cluster)
 		if err := h.r.List(_ctx, crList, listOpts...); err != nil {
@@ -966,12 +1036,22 @@ func (h historiesByComponentRevision) Less(i, j int) bool {
 }
 
 // UpdateApplicationRevisionStatus update application revision status
-func (h *AppHandler) UpdateApplicationRevisionStatus(ctx context.Context, appRev *v1beta1.ApplicationRevision, succeed bool, wfStatus *common.WorkflowStatus) {
-	if appRev == nil {
+func (h *AppHandler) UpdateApplicationRevisionStatus(ctx context.Context, appRev *v1beta1.ApplicationRevision, wfStatus *common.WorkflowStatus) {
+	if appRev == nil || DisableAllApplicationRevision {
 		return
 	}
-	appRev.Status.Succeeded = succeed
+	appRev.Status.Succeeded = wfStatus.Phase == workflowv1alpha1.WorkflowStateSucceeded
 	appRev.Status.Workflow = wfStatus
+
+	// Versioned the context backend values.
+	if wfStatus.ContextBackend != nil {
+		var cm corev1.ConfigMap
+		if err := h.r.Client.Get(ctx, ktypes.NamespacedName{Namespace: wfStatus.ContextBackend.Namespace, Name: wfStatus.ContextBackend.Name}, &cm); err != nil {
+			klog.Error(err, "[UpdateApplicationRevisionStatus] failed to load the context values", "ApplicationRevision", appRev.Name)
+		}
+		appRev.Status.WorkflowContext = cm.Data
+	}
+
 	if err := h.r.Client.Status().Update(ctx, appRev); err != nil {
 		if logCtx, ok := ctx.(monitorContext.Context); ok {
 			logCtx.Error(err, "[UpdateApplicationRevisionStatus] failed to update application revision status", "ApplicationRevision", appRev.Name)
@@ -983,12 +1063,14 @@ func (h *AppHandler) UpdateApplicationRevisionStatus(ctx context.Context, appRev
 
 // GetAppRevisions get application revisions by label
 func GetAppRevisions(ctx context.Context, cli client.Client, appName string, appNs string) ([]v1beta1.ApplicationRevision, error) {
-	listOpts := []client.ListOption{
-		client.InNamespace(appNs),
-		client.MatchingLabels{oam.LabelAppName: appName},
-	}
 	appRevisionList := new(v1beta1.ApplicationRevisionList)
-	if err := cli.List(ctx, appRevisionList, listOpts...); err != nil {
+	var err error
+	if cache.OptimizeListOp {
+		err = cli.List(ctx, appRevisionList, client.MatchingFields{cache.AppIndex: appNs + "/" + appName})
+	} else {
+		err = cli.List(ctx, appRevisionList, client.InNamespace(appNs), client.MatchingLabels{oam.LabelAppName: appName})
+	}
+	if err != nil {
 		return nil, err
 	}
 	return appRevisionList.Items, nil

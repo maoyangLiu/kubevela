@@ -19,10 +19,8 @@ package application
 import (
 	"context"
 	"sync"
+	"time"
 
-	terraformtypes "github.com/oam-dev/terraform-controller/api/types"
-	terraforv1beta1 "github.com/oam-dev/terraform-controller/api/v1beta1"
-	terraforv1beta2 "github.com/oam-dev/terraform-controller/api/v1beta2"
 	"github.com/pkg/errors"
 	corev1 "k8s.io/api/core/v1"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
@@ -30,14 +28,20 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	monitorContext "github.com/kubevela/pkg/monitor/context"
+	pkgmulticluster "github.com/kubevela/pkg/multicluster"
+	terraformtypes "github.com/oam-dev/terraform-controller/api/types"
+	terraforv1beta1 "github.com/oam-dev/terraform-controller/api/v1beta1"
+	terraforv1beta2 "github.com/oam-dev/terraform-controller/api/v1beta2"
+
 	"github.com/oam-dev/kubevela/apis/core.oam.dev/common"
 	"github.com/oam-dev/kubevela/apis/core.oam.dev/v1beta1"
 	"github.com/oam-dev/kubevela/apis/types"
 	"github.com/oam-dev/kubevela/pkg/appfile"
-	monitorContext "github.com/oam-dev/kubevela/pkg/monitor/context"
 	"github.com/oam-dev/kubevela/pkg/monitor/metrics"
 	"github.com/oam-dev/kubevela/pkg/multicluster"
 	"github.com/oam-dev/kubevela/pkg/oam"
+	"github.com/oam-dev/kubevela/pkg/oam/util"
 	"github.com/oam-dev/kubevela/pkg/resourcekeeper"
 )
 
@@ -64,7 +68,7 @@ type AppHandler struct {
 func NewAppHandler(ctx context.Context, r *Reconciler, app *v1beta1.Application, parser *appfile.Parser) (*AppHandler, error) {
 	if ctx, ok := ctx.(monitorContext.Context); ok {
 		subCtx := ctx.Fork("create-app-handler", monitorContext.DurationMetric(func(v float64) {
-			metrics.CreateAppHandlerDurationHistogram.WithLabelValues("application").Observe(v)
+			metrics.AppReconcileStageDurationHistogram.WithLabelValues("create-app-handler").Observe(v)
 		}))
 		defer subCtx.Commit("finish create appHandler")
 	}
@@ -81,7 +85,7 @@ func NewAppHandler(ctx context.Context, r *Reconciler, app *v1beta1.Application,
 }
 
 // Dispatch apply manifests into k8s.
-func (h *AppHandler) Dispatch(ctx context.Context, cluster string, owner common.ResourceCreatorRole, manifests ...*unstructured.Unstructured) error {
+func (h *AppHandler) Dispatch(ctx context.Context, cluster string, owner string, manifests ...*unstructured.Unstructured) error {
 	manifests = multicluster.ResourcesWithClusterName(cluster, manifests...)
 	if err := h.resourceKeeper.Dispatch(ctx, manifests, nil); err != nil {
 		return err
@@ -109,7 +113,7 @@ func (h *AppHandler) Dispatch(ctx context.Context, cluster string, owner common.
 }
 
 // Delete delete manifests from k8s.
-func (h *AppHandler) Delete(ctx context.Context, cluster string, owner common.ResourceCreatorRole, manifest *unstructured.Unstructured) error {
+func (h *AppHandler) Delete(ctx context.Context, cluster string, owner string, manifest *unstructured.Unstructured) error {
 	manifests := multicluster.ResourcesWithClusterName(cluster, manifest)
 	if err := h.resourceKeeper.Delete(ctx, manifests); err != nil {
 		return err
@@ -185,6 +189,17 @@ func removeResources(elements []common.ClusterObjectReference, index int) []comm
 	return elements[:len(elements)-1]
 }
 
+// getServiceStatus get specified component status
+func (h *AppHandler) getServiceStatus(svc common.ApplicationComponentStatus) common.ApplicationComponentStatus {
+	for i := range h.services {
+		current := h.services[i]
+		if current.Equal(svc) {
+			return current
+		}
+	}
+	return svc
+}
+
 // addServiceStatus recorde the whole component status.
 // reconcile run at single threaded. So there is no need to consider to use locker.
 func (h *AppHandler) addServiceStatus(cover bool, svcs ...common.ApplicationComponentStatus) {
@@ -194,7 +209,7 @@ func (h *AppHandler) addServiceStatus(cover bool, svcs ...common.ApplicationComp
 		found := false
 		for i := range h.services {
 			current := h.services[i]
-			if current.Name == svc.Name && current.Env == svc.Env && current.Namespace == svc.Namespace && current.Cluster == svc.Cluster {
+			if current.Equal(svc) {
 				if cover {
 					h.services[i] = svc
 				}
@@ -213,82 +228,144 @@ func (h *AppHandler) ProduceArtifacts(ctx context.Context, comps []*types.Compon
 	return h.createResourcesConfigMap(ctx, h.currentAppRev, comps, policies)
 }
 
-// nolint
-func (h *AppHandler) collectHealthStatus(ctx context.Context, wl *appfile.Workload, appRev *v1beta1.ApplicationRevision, overrideNamespace string) (*common.ApplicationComponentStatus, bool, error) {
-	namespace := h.app.Namespace
-	if overrideNamespace != "" {
-		namespace = overrideNamespace
-	}
+// collectTraitHealthStatus collect trait health status
+func (h *AppHandler) collectTraitHealthStatus(wl *appfile.Workload, tr *appfile.Trait, appRev *v1beta1.ApplicationRevision, overrideNamespace string) (common.ApplicationTraitStatus, []*unstructured.Unstructured, error) {
+	defer func(clusterName string) {
+		wl.Ctx.SetCtx(pkgmulticluster.WithCluster(wl.Ctx.GetCtx(), clusterName))
+	}(multicluster.ClusterNameInContext(wl.Ctx.GetCtx()))
 
+	var (
+		pCtx        = wl.Ctx
+		appName     = appRev.Spec.Application.Name
+		traitStatus = common.ApplicationTraitStatus{
+			Type:    tr.Name,
+			Healthy: true,
+		}
+		traitOverrideNamespace = overrideNamespace
+		err                    error
+	)
+	if tr.FullTemplate.TraitDefinition.Spec.ControlPlaneOnly {
+		traitOverrideNamespace = appRev.GetNamespace()
+		pCtx.SetCtx(pkgmulticluster.WithCluster(pCtx.GetCtx(), pkgmulticluster.Local))
+	}
+	_accessor := util.NewApplicationResourceNamespaceAccessor(h.app.Namespace, traitOverrideNamespace)
+	templateContext, err := tr.GetTemplateContext(pCtx, h.r.Client, _accessor)
+	if err != nil {
+		return common.ApplicationTraitStatus{}, nil, errors.WithMessagef(err, "app=%s, comp=%s, trait=%s, get template context error", appName, wl.Name, tr.Name)
+	}
+	if ok, err := tr.EvalHealth(templateContext); !ok || err != nil {
+		traitStatus.Healthy = false
+	}
+	traitStatus.Message, err = tr.EvalStatus(templateContext)
+	if err != nil {
+		return common.ApplicationTraitStatus{}, nil, errors.WithMessagef(err, "app=%s, comp=%s, trait=%s, evaluate status message error", appName, wl.Name, tr.Name)
+	}
+	return traitStatus, extractOutputs(templateContext), nil
+}
+
+// collectWorkloadHealthStatus collect workload health status
+func (h *AppHandler) collectWorkloadHealthStatus(ctx context.Context, wl *appfile.Workload, appRev *v1beta1.ApplicationRevision, status *common.ApplicationComponentStatus, accessor util.NamespaceAccessor) (bool, *unstructured.Unstructured, []*unstructured.Unstructured, error) {
+	var output *unstructured.Unstructured
+	var outputs []*unstructured.Unstructured
+	var (
+		appName  = appRev.Spec.Application.Name
+		isHealth = true
+	)
+	if wl.CapabilityCategory == types.TerraformCategory {
+		var configuration terraforv1beta2.Configuration
+		if err := h.r.Client.Get(ctx, client.ObjectKey{Name: wl.Name, Namespace: accessor.Namespace()}, &configuration); err != nil {
+			if kerrors.IsNotFound(err) {
+				var legacyConfiguration terraforv1beta1.Configuration
+				if err := h.r.Client.Get(ctx, client.ObjectKey{Name: wl.Name, Namespace: accessor.Namespace()}, &legacyConfiguration); err != nil {
+					return false, nil, nil, errors.WithMessagef(err, "app=%s, comp=%s, check health error", appName, wl.Name)
+				}
+				isHealth = setStatus(status, legacyConfiguration.Status.ObservedGeneration, legacyConfiguration.Generation,
+					legacyConfiguration.GetLabels(), appRev.Name, legacyConfiguration.Status.Apply.State, legacyConfiguration.Status.Apply.Message)
+			} else {
+				return false, nil, nil, errors.WithMessagef(err, "app=%s, comp=%s, check health error", appName, wl.Name)
+			}
+		} else {
+			isHealth = setStatus(status, configuration.Status.ObservedGeneration, configuration.Generation, configuration.GetLabels(),
+				appRev.Name, configuration.Status.Apply.State, configuration.Status.Apply.Message)
+		}
+	} else {
+		templateContext, err := wl.GetTemplateContext(wl.Ctx, h.r.Client, accessor)
+		if err != nil {
+			return false, nil, nil, errors.WithMessagef(err, "app=%s, comp=%s, get template context error", appName, wl.Name)
+		}
+		if ok, err := wl.EvalHealth(templateContext); !ok || err != nil {
+			isHealth = false
+		}
+		status.Healthy = isHealth
+		status.Message, err = wl.EvalStatus(templateContext)
+		if err != nil {
+			return false, nil, nil, errors.WithMessagef(err, "app=%s, comp=%s, evaluate workload status message error", appName, wl.Name)
+		}
+		output, outputs = extractOutputAndOutputs(templateContext)
+	}
+	return isHealth, output, outputs, nil
+}
+
+// nolint
+// collectHealthStatus will collect health status of component, including component itself and traits.
+func (h *AppHandler) collectHealthStatus(ctx context.Context, wl *appfile.Workload, appRev *v1beta1.ApplicationRevision, overrideNamespace string, skipWorkload bool, traitFilters ...TraitFilter) (*common.ApplicationComponentStatus, *unstructured.Unstructured, []*unstructured.Unstructured, bool, error) {
+	output := new(unstructured.Unstructured)
+	outputs := make([]*unstructured.Unstructured, 0)
+	accessor := util.NewApplicationResourceNamespaceAccessor(h.app.Namespace, overrideNamespace)
 	var (
 		status = common.ApplicationComponentStatus{
 			Name:               wl.Name,
 			WorkloadDefinition: wl.FullTemplate.Reference.Definition,
 			Healthy:            true,
-			Namespace:          namespace,
+			Namespace:          accessor.Namespace(),
 			Cluster:            multicluster.ClusterNameInContext(ctx),
 		}
-		appName  = appRev.Spec.Application.Name
 		isHealth = true
 		err      error
 	)
 
-	if wl.CapabilityCategory == types.TerraformCategory {
-		var configuration terraforv1beta2.Configuration
-		if err := h.r.Client.Get(ctx, client.ObjectKey{Name: wl.Name, Namespace: namespace}, &configuration); err != nil {
-			if kerrors.IsNotFound(err) {
-				var legacyConfiguration terraforv1beta1.Configuration
-				if err := h.r.Client.Get(ctx, client.ObjectKey{Name: wl.Name, Namespace: namespace}, &legacyConfiguration); err != nil {
-					return nil, false, errors.WithMessagef(err, "app=%s, comp=%s, check health error", appName, wl.Name)
-				}
-				isHealth = setStatus(&status, legacyConfiguration.Status.ObservedGeneration, legacyConfiguration.Generation,
-					legacyConfiguration.GetLabels(), appRev.Name, legacyConfiguration.Status.Apply.State, legacyConfiguration.Status.Apply.Message)
-			} else {
-				return nil, false, errors.WithMessagef(err, "app=%s, comp=%s, check health error", appName, wl.Name)
-			}
-		} else {
-			isHealth = setStatus(&status, configuration.Status.ObservedGeneration, configuration.Generation, configuration.GetLabels(),
-				appRev.Name, configuration.Status.Apply.State, configuration.Status.Apply.Message)
-		}
-	} else {
-		if ok, err := wl.EvalHealth(wl.Ctx, h.r.Client, namespace); !ok || err != nil {
-			isHealth = false
-			status.Healthy = false
-		}
-
-		status.Message, err = wl.EvalStatus(wl.Ctx, h.r.Client, namespace)
+	status = h.getServiceStatus(status)
+	if !skipWorkload {
+		isHealth, output, outputs, err = h.collectWorkloadHealthStatus(ctx, wl, appRev, &status, accessor)
 		if err != nil {
-			return nil, false, errors.WithMessagef(err, "app=%s, comp=%s, evaluate workload status message error", appName, wl.Name)
+			return nil, nil, nil, false, err
 		}
 	}
 
 	var traitStatusList []common.ApplicationTraitStatus
+collectNext:
 	for _, tr := range wl.Traits {
-		if tr.FullTemplate.TraitDefinition.Spec.ControlPlaneOnly {
-			namespace = appRev.GetNamespace()
-			wl.Ctx.SetCtx(context.WithValue(wl.Ctx.GetCtx(), multicluster.ClusterContextKey, multicluster.ClusterLocalName))
+		for _, filter := range traitFilters {
+			// If filtered out by one of the filters
+			if filter(*tr) {
+				continue collectNext
+			}
 		}
-		var traitStatus = common.ApplicationTraitStatus{
-			Type:    tr.Name,
-			Healthy: true,
-		}
-		if ok, err := tr.EvalHealth(wl.Ctx, h.r.Client, namespace); !ok || err != nil {
-			isHealth = false
-			traitStatus.Healthy = false
-		}
-		traitStatus.Message, err = tr.EvalStatus(wl.Ctx, h.r.Client, namespace)
+
+		traitStatus, _outputs, err := h.collectTraitHealthStatus(wl, tr, appRev, overrideNamespace)
 		if err != nil {
-			return nil, false, errors.WithMessagef(err, "app=%s, comp=%s, trait=%s, evaluate status message error", appName, wl.Name, tr.Name)
+			return nil, nil, nil, false, err
+		}
+		outputs = append(outputs, _outputs...)
+
+		isHealth = isHealth && traitStatus.Healthy
+		if status.Message == "" && traitStatus.Message != "" {
+			status.Message = traitStatus.Message
 		}
 		traitStatusList = append(traitStatusList, traitStatus)
-		namespace = appRev.GetNamespace()
-		wl.Ctx.SetCtx(context.WithValue(wl.Ctx.GetCtx(), multicluster.ClusterContextKey, status.Cluster))
-	}
 
-	status.Traits = traitStatusList
+		var oldStatus []common.ApplicationTraitStatus
+		for _, _trait := range status.Traits {
+			if _trait.Type != tr.Name {
+				oldStatus = append(oldStatus, _trait)
+			}
+		}
+		status.Traits = oldStatus
+	}
+	status.Traits = append(status.Traits, traitStatusList...)
 	status.Scopes = generateScopeReference(wl.Scopes)
 	h.addServiceStatus(true, status)
-	return &status, isHealth, nil
+	return &status, output, outputs, isHealth, nil
 }
 
 func setStatus(status *common.ApplicationComponentStatus, observedGeneration, generation int64, labels map[string]string,
@@ -305,12 +382,12 @@ func setStatus(status *common.ApplicationComponentStatus, observedGeneration, ge
 		}
 		return true
 	}
+	status.Message = message
 	if !isLatest() || state != terraformtypes.Available {
 		status.Healthy = false
 		return false
 	}
 	status.Healthy = true
-	status.Message = message
 	return true
 }
 
@@ -335,6 +412,10 @@ type garbageCollectFunc func(ctx context.Context, h *AppHandler) error
 // - clean up legacy app revisions
 // - clean up legacy component revisions
 func garbageCollection(ctx context.Context, h *AppHandler) error {
+	t := time.Now()
+	defer func() {
+		metrics.AppReconcileStageDurationHistogram.WithLabelValues("gc-rev").Observe(time.Since(t).Seconds())
+	}()
 	collectFuncs := []garbageCollectFunc{
 		garbageCollectFunc(cleanUpApplicationRevision),
 		garbageCollectFunc(cleanUpWorkflowComponentRevision),
@@ -351,7 +432,7 @@ func garbageCollection(ctx context.Context, h *AppHandler) error {
 func (h *AppHandler) ApplyPolicies(ctx context.Context, af *appfile.Appfile) error {
 	if ctx, ok := ctx.(monitorContext.Context); ok {
 		subCtx := ctx.Fork("apply-policies", monitorContext.DurationMetric(func(v float64) {
-			metrics.ApplyPoliciesDurationHistogram.WithLabelValues("application").Observe(v)
+			metrics.AppReconcileStageDurationHistogram.WithLabelValues("apply-policies").Observe(v)
 		}))
 		defer subCtx.Commit("finish apply policies")
 	}
@@ -360,9 +441,34 @@ func (h *AppHandler) ApplyPolicies(ctx context.Context, af *appfile.Appfile) err
 		return errors.Wrapf(err, "failed to render policy manifests")
 	}
 	if len(policyManifests) > 0 {
+		for _, policyManifest := range policyManifests {
+			util.AddLabels(policyManifest, map[string]string{
+				oam.LabelAppName:      h.app.GetName(),
+				oam.LabelAppNamespace: h.app.GetNamespace(),
+			})
+		}
 		if err = h.Dispatch(ctx, "", common.PolicyResourceCreator, policyManifests...); err != nil {
 			return errors.Wrapf(err, "failed to dispatch policy manifests")
 		}
 	}
 	return nil
+}
+
+func extractOutputAndOutputs(templateContext map[string]interface{}) (*unstructured.Unstructured, []*unstructured.Unstructured) {
+	output := new(unstructured.Unstructured)
+	if templateContext["output"] != nil {
+		output = &unstructured.Unstructured{Object: templateContext["output"].(map[string]interface{})}
+	}
+	outputs := extractOutputs(templateContext)
+	return output, outputs
+}
+
+func extractOutputs(templateContext map[string]interface{}) []*unstructured.Unstructured {
+	outputs := make([]*unstructured.Unstructured, 0)
+	if templateContext["outputs"] != nil {
+		for _, v := range templateContext["outputs"].(map[string]interface{}) {
+			outputs = append(outputs, &unstructured.Unstructured{Object: v.(map[string]interface{})})
+		}
+	}
+	return outputs
 }

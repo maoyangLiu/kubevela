@@ -18,16 +18,13 @@ package addon
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"path/filepath"
 
-	"k8s.io/client-go/discovery"
-	"k8s.io/klog/v2"
-
+	"github.com/pkg/errors"
 	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -36,6 +33,7 @@ import (
 	"github.com/oam-dev/kubevela/apis/types"
 	"github.com/oam-dev/kubevela/pkg/multicluster"
 	"github.com/oam-dev/kubevela/pkg/oam"
+	addonutil "github.com/oam-dev/kubevela/pkg/utils/addon"
 	"github.com/oam-dev/kubevela/pkg/utils/apply"
 	"github.com/oam-dev/kubevela/pkg/utils/common"
 )
@@ -49,22 +47,21 @@ const (
 	enabling = "enabling"
 	// disabling indicates the addon related app is deleting
 	disabling = "disabling"
-	// suspend indicates the addon related app is suspend
+	// suspend indicates the addon related app is suspended
 	suspend = "suspend"
 )
 
 // EnableAddon will enable addon with dependency check, source is where addon from.
-func EnableAddon(ctx context.Context, name string, version string, cli client.Client, discoveryClient *discovery.DiscoveryClient, apply apply.Applicator, config *rest.Config, r Registry, args map[string]interface{}, cache *Cache) error {
-	h := NewAddonInstaller(ctx, cli, discoveryClient, apply, config, &r, args, cache)
+func EnableAddon(ctx context.Context, name string, version string, cli client.Client, discoveryClient *discovery.DiscoveryClient, apply apply.Applicator, config *rest.Config, r Registry, args map[string]interface{}, cache *Cache, registries []Registry, opts ...InstallOption) (string, error) {
+	h := NewAddonInstaller(ctx, cli, discoveryClient, apply, config, &r, args, cache, registries, opts...)
 	pkg, err := h.loadInstallPackage(name, version)
 	if err != nil {
-		return err
+		return "", err
 	}
-	err = h.enableAddon(pkg)
-	if err != nil {
-		return err
+	if err := validateAddonPackage(pkg); err != nil {
+		return "", errors.Wrap(err, fmt.Sprintf("failed to enable addon: %s", name))
 	}
-	return nil
+	return h.enableAddon(pkg)
 }
 
 // DisableAddon will disable addon from cluster.
@@ -82,7 +79,7 @@ func DisableAddon(ctx context.Context, cli client.Client, name string, config *r
 			return err
 		}
 		if len(usingAddonApp) != 0 {
-			return fmt.Errorf(fmt.Sprintf("%s please delete them first", usingAppsInfo(usingAddonApp)))
+			return errors.New(appsDependsOnAddonErrInfo(usingAddonApp))
 		}
 	}
 
@@ -93,39 +90,37 @@ func DisableAddon(ctx context.Context, cli client.Client, name string, config *r
 }
 
 // EnableAddonByLocalDir enable an addon from local dir
-func EnableAddonByLocalDir(ctx context.Context, name string, dir string, cli client.Client, dc *discovery.DiscoveryClient, applicator apply.Applicator, config *rest.Config, args map[string]interface{}) error {
+func EnableAddonByLocalDir(ctx context.Context, name string, dir string, cli client.Client, dc *discovery.DiscoveryClient, applicator apply.Applicator, config *rest.Config, args map[string]interface{}, opts ...InstallOption) (string, error) {
 	absDir, err := filepath.Abs(dir)
 	if err != nil {
-		return err
+		return "", err
 	}
 	r := localReader{dir: absDir, name: name}
 	metas, err := r.ListAddonMeta()
 	if err != nil {
-		return err
+		return "", err
 	}
 	meta := metas[r.name]
 	UIData, err := GetUIDataFromReader(r, &meta, UIMetaOptions)
 	if err != nil {
-		return err
+		return "", err
 	}
 	pkg, err := GetInstallPackageFromReader(r, &meta, UIData)
 	if err != nil {
-		return err
+		return "", err
 	}
-	h := NewAddonInstaller(ctx, cli, dc, applicator, config, &Registry{Name: LocalAddonRegistryName}, args, nil)
+	if err := validateAddonPackage(pkg); err != nil {
+		return "", errors.Wrap(err, fmt.Sprintf("failed to enable addon by local dir: %s", dir))
+	}
+	h := NewAddonInstaller(ctx, cli, dc, applicator, config, &Registry{Name: LocalAddonRegistryName}, args, nil, nil, opts...)
 	needEnableAddonNames, err := h.checkDependency(pkg)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if len(needEnableAddonNames) > 0 {
-		return fmt.Errorf("you must first enable dependencies: %v", needEnableAddonNames)
+		return "", fmt.Errorf("you must first enable dependencies: %v", needEnableAddonNames)
 	}
-
-	err = h.enableAddon(pkg)
-	if err != nil {
-		return err
-	}
-	return nil
+	return h.enableAddon(pkg)
 }
 
 // GetAddonStatus is general func for cli and apiServer get addon status
@@ -162,7 +157,7 @@ func GetAddonStatus(ctx context.Context, cli client.Client, name string) (Status
 
 	// Get addon parameters
 	var sec v1.Secret
-	err = cli.Get(ctx, client.ObjectKey{Namespace: types.DefaultKubeVelaNS, Name: Convert2SecName(name)}, &sec)
+	err = cli.Get(ctx, client.ObjectKey{Namespace: types.DefaultKubeVelaNS, Name: addonutil.Addon2SecName(name)}, &sec)
 	if err != nil {
 		// Not found error can be ignored. Others can't.
 		if !apierrors.IsNotFound(err) {
@@ -180,45 +175,6 @@ func GetAddonStatus(ctx context.Context, cli client.Client, name string) (Status
 	switch app.Status.Phase {
 	case commontypes.ApplicationRunning:
 		addonStatus.AddonPhase = enabled
-		if name == ObservabilityAddon {
-			// TODO(wonderflow): this is a hack Implementation and need be fixed in a unified way
-			var (
-				sec    v1.Secret
-				domain string
-			)
-			if err = cli.Get(ctx, client.ObjectKey{Namespace: types.DefaultKubeVelaNS, Name: Convert2SecName(name)}, &sec); err != nil {
-				klog.ErrorS(err, "failed to get observability secret")
-				addonStatus.AddonPhase = enabling
-				addonStatus.InstalledVersion = ""
-				return addonStatus, nil
-			}
-
-			if v, ok := sec.Data[ObservabilityAddonDomainArg]; ok {
-				domain = string(v)
-			}
-			observability, err := GetObservabilityAccessibilityInfo(ctx, cli, domain)
-			if err != nil {
-				klog.ErrorS(err, "failed to get observability accessibility info")
-				addonStatus.AddonPhase = enabling
-				addonStatus.InstalledVersion = ""
-				return addonStatus, nil
-			}
-
-			for _, o := range observability {
-				var access = fmt.Sprintf("No loadBalancer found, visiting by using 'vela port-forward %s", ObservabilityAddon)
-				if o.LoadBalancerIP != "" {
-					access = fmt.Sprintf("Visiting URL: %s, IP: %s", o.Domain, o.LoadBalancerIP)
-				}
-				clusters[o.Cluster] = map[string]interface{}{
-					"domain":            o.Domain,
-					"loadBalancerIP":    o.LoadBalancerIP,
-					"access":            access,
-					"serviceExternalIP": o.ServiceExternalIP,
-				}
-			}
-
-			return addonStatus, nil
-		}
 		return addonStatus, nil
 	case commontypes.ApplicationDeleting:
 		addonStatus.AddonPhase = disabling
@@ -229,58 +185,8 @@ func GetAddonStatus(ctx context.Context, cli client.Client, name string) (Status
 	}
 }
 
-// GetObservabilityAccessibilityInfo will get the accessibility info of addon in local cluster and multiple clusters
-func GetObservabilityAccessibilityInfo(ctx context.Context, k8sClient client.Client, domain string) ([]ObservabilityEnvironment, error) {
-	domains, err := allocateDomainForAddon(ctx, k8sClient)
-	if err != nil {
-		return nil, err
-	}
-
-	obj := new(unstructured.Unstructured)
-	obj.SetKind("Service")
-	obj.SetAPIVersion("v1")
-	key := client.ObjectKeyFromObject(obj)
-	key.Namespace = types.DefaultKubeVelaNS
-	key.Name = ObservabilityAddonEndpointComponent
-	for i, d := range domains {
-		if err != nil {
-			return nil, err
-		}
-		readCtx := multicluster.ContextWithClusterName(ctx, d.Cluster)
-		if err := k8sClient.Get(readCtx, key, obj); err != nil {
-			return nil, err
-		}
-		var svc v1.Service
-		data, err := obj.MarshalJSON()
-		if err != nil {
-			return nil, err
-		}
-		if err := json.Unmarshal(data, &svc); err != nil {
-			return nil, err
-		}
-		if svc.Status.LoadBalancer.Ingress != nil && len(svc.Status.LoadBalancer.Ingress) == 1 {
-			domains[i].ServiceExternalIP = svc.Status.LoadBalancer.Ingress[0].IP
-		}
-	}
-	// set domain for the cluster if there is no child clusters
-	if len(domains) == 0 {
-		var svc v1.Service
-		if err := k8sClient.Get(ctx, client.ObjectKey{Name: ObservabilityAddonEndpointComponent, Namespace: types.DefaultKubeVelaNS}, &svc); err != nil {
-			return nil, err
-		}
-		if svc.Status.LoadBalancer.Ingress != nil && len(svc.Status.LoadBalancer.Ingress) == 1 {
-			domains = []ObservabilityEnvironment{
-				{
-					ServiceExternalIP: svc.Status.LoadBalancer.Ingress[0].IP,
-				},
-			}
-		}
-	}
-	return domains, nil
-}
-
-// FindWholeAddonPackagesFromRegistry find addons' WholeInstallPackage from registries, empty registryName indicates matching all
-func FindWholeAddonPackagesFromRegistry(ctx context.Context, k8sClient client.Client, addonNames []string, registryNames []string) ([]*WholeAddonPackage, error) {
+// FindAddonPackagesDetailFromRegistry find addons' WholeInstallPackage from registries, empty registryName indicates matching all
+func FindAddonPackagesDetailFromRegistry(ctx context.Context, k8sClient client.Client, addonNames []string, registryNames []string) ([]*WholeAddonPackage, error) {
 	var addons []*WholeAddonPackage
 	var registries []Registry
 
@@ -325,7 +231,11 @@ func FindWholeAddonPackagesFromRegistry(ctx context.Context, k8sClient client.Cl
 	// Find matched addons in registries
 	for _, r := range registries {
 		if IsVersionRegistry(r) {
-			vr := BuildVersionedRegistry(r.Name, r.Helm.URL, &common.HTTPOption{Username: r.Helm.Username, Password: r.Helm.Password})
+			vr := BuildVersionedRegistry(r.Name, r.Helm.URL, &common.HTTPOption{
+				Username:        r.Helm.Username,
+				Password:        r.Helm.Password,
+				InsecureSkipTLS: r.Helm.InsecureSkipTLS,
+			})
 			for _, addonName := range addonNames {
 				wholePackage, err := vr.GetDetailedAddon(ctx, addonName, "")
 				if err != nil {

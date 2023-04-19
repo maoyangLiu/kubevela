@@ -17,10 +17,18 @@ limitations under the License.
 package dryrun
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
+
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/yaml"
+
+	"github.com/oam-dev/kubevela/apis/core.oam.dev/v1beta1"
+	"github.com/oam-dev/kubevela/apis/types"
 
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
@@ -31,13 +39,13 @@ import (
 	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
-	"sigs.k8s.io/controller-runtime/pkg/envtest/printer"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
+	"github.com/kubevela/workflow/pkg/cue/packages"
+
 	coreoam "github.com/oam-dev/kubevela/apis/core.oam.dev"
 	"github.com/oam-dev/kubevela/pkg/appfile"
-	"github.com/oam-dev/kubevela/pkg/cue/packages"
 	"github.com/oam-dev/kubevela/pkg/oam"
 	"github.com/oam-dev/kubevela/pkg/oam/discoverymapper"
 	oamutil "github.com/oam-dev/kubevela/pkg/oam/util"
@@ -54,9 +62,7 @@ var diffOpt *LiveDiffOption
 
 func TestDryRun(t *testing.T) {
 	RegisterFailHandler(Fail)
-	RunSpecsWithDefaultAndCustomReporters(t,
-		"Cli Suite",
-		[]Reporter{printer.NewlineReporter{}})
+	RunSpecs(t, "Cli Suite")
 }
 
 var _ = BeforeSuite(func(done Done) {
@@ -90,24 +96,29 @@ var _ = BeforeSuite(func(done Done) {
 
 	By("Prepare capability definitions")
 	myingressYAML := readDataFromFile("./testdata/td-myingress.yaml")
-	myscalerYAML := readDataFromFile("./testdata/td-myscaler.yaml")
 	myworkerYAML := readDataFromFile("./testdata/cd-myworker.yaml")
 
 	myworkerDef, err := oamutil.UnMarshalStringToComponentDefinition(myworkerYAML)
 	Expect(err).Should(BeNil())
 	myingressDef, err := oamutil.UnMarshalStringToTraitDefinition(myingressYAML)
 	Expect(err).Should(BeNil())
-	myscalerDef, err := oamutil.UnMarshalStringToTraitDefinition(myscalerYAML)
-	Expect(err).Should(BeNil())
 
 	cdMyWorker, err := oamutil.Object2Unstructured(myworkerDef)
 	Expect(err).Should(BeNil())
 	tdMyIngress, err := oamutil.Object2Unstructured(myingressDef)
 	Expect(err).Should(BeNil())
-	tdMyScaler, err := oamutil.Object2Unstructured(myscalerDef)
-	Expect(err).Should(BeNil())
 
-	dryrunOpt = NewDryRunOption(k8sClient, cfg, dm, pd, []oam.Object{cdMyWorker, tdMyIngress, tdMyScaler})
+	// create vela-system ns
+	Expect(k8sClient.Create(context.TODO(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: types.DefaultKubeVelaNS}})).Should(Succeed())
+	// create deploy workflow step definition
+	deploy, err := os.ReadFile("./testdata/wd-deploy.yaml")
+	Expect(err).Should(BeNil())
+	var wfsd v1beta1.WorkflowStepDefinition
+	Expect(yaml.Unmarshal([]byte(deploy), &wfsd)).Should(BeNil())
+	wfsd.SetNamespace(types.DefaultKubeVelaNS)
+	Expect(k8sClient.Create(context.TODO(), &wfsd)).Should(BeNil())
+
+	dryrunOpt = NewDryRunOption(k8sClient, cfg, dm, pd, []oam.Object{cdMyWorker, tdMyIngress}, false)
 	diffOpt = &LiveDiffOption{DryRun: dryrunOpt, Parser: appfile.NewApplicationParser(k8sClient, dm, pd)}
 
 	close(done)

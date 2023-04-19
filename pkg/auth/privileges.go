@@ -249,6 +249,10 @@ const (
 	KubeVelaReaderRoleName = "kubevela:reader"
 	// KubeVelaWriterRoleName a role that can read/write any resources
 	KubeVelaWriterRoleName = "kubevela:writer"
+	// KubeVelaWriterAppRoleName a role that can read/write any application
+	KubeVelaWriterAppRoleName = "kubevela:writer:application"
+	// KubeVelaReaderAppRoleName a role that can read any application
+	KubeVelaReaderAppRoleName = "kubevela:reader:application"
 )
 
 // ScopedPrivilege includes all resource privileges in the destination
@@ -287,11 +291,9 @@ func (p *ScopedPrivilege) GetRoles() []client.Object {
 // GetRoleBinding the underlying RoleBinding/ClusterRoleBinding for the privilege
 func (p *ScopedPrivilege) GetRoleBinding(subs []rbacv1.Subject) client.Object {
 	var binding client.Object
-	var roleName string
+	var roleName = KubeVelaWriterRoleName
 	if p.ReadOnly {
 		roleName = KubeVelaReaderRoleName
-	} else {
-		roleName = KubeVelaWriterRoleName
 	}
 	if p.Namespace == "" {
 		binding = &rbacv1.ClusterRoleBinding{
@@ -306,6 +308,69 @@ func (p *ScopedPrivilege) GetRoleBinding(subs []rbacv1.Subject) client.Object {
 		binding.SetNamespace(p.Namespace)
 	}
 	binding.SetName(p.Prefix + roleName + ":binding")
+	return binding
+}
+
+// ApplicationPrivilege includes the application privileges in the destination
+type ApplicationPrivilege struct {
+	Prefix    string
+	Cluster   string
+	Namespace string
+	ReadOnly  bool
+}
+
+// GetCluster the cluster of the privilege
+func (a *ApplicationPrivilege) GetCluster() string {
+	return a.Cluster
+}
+
+// GetRoles the underlying Roles/ClusterRoles for the privilege
+func (a *ApplicationPrivilege) GetRoles() []client.Object {
+	verbs := []string{"get", "list", "watch", "create", "update", "patch", "delete"}
+	name := a.Prefix + KubeVelaWriterAppRoleName
+	if a.ReadOnly {
+		verbs = []string{"get", "list", "watch"}
+		name = a.Prefix + KubeVelaReaderAppRoleName
+	}
+	return []client.Object{
+		&rbacv1.ClusterRole{
+			ObjectMeta: metav1.ObjectMeta{Name: name},
+			Rules: []rbacv1.PolicyRule{
+				{
+					APIGroups: []string{"core.oam.dev"},
+					Resources: []string{"applications", "applications/status", "policies", "workflows", "workflowruns", "workflowruns/status"},
+					Verbs:     verbs,
+				},
+				{
+					APIGroups: []string{""},
+					Resources: []string{"secrets", "configmaps"},
+					Verbs:     verbs,
+				},
+			},
+		},
+	}
+}
+
+// GetRoleBinding the underlying RoleBinding/ClusterRoleBinding for the privilege
+func (a *ApplicationPrivilege) GetRoleBinding(subs []rbacv1.Subject) client.Object {
+	var binding client.Object
+	var roleName = KubeVelaWriterAppRoleName
+	if a.ReadOnly {
+		roleName = KubeVelaReaderAppRoleName
+	}
+	if a.Namespace == "" {
+		binding = &rbacv1.ClusterRoleBinding{
+			RoleRef:  rbacv1.RoleRef{Kind: "ClusterRole", APIGroup: rbacv1.GroupName, Name: roleName},
+			Subjects: subs,
+		}
+	} else {
+		binding = &rbacv1.RoleBinding{
+			RoleRef:  rbacv1.RoleRef{Kind: "ClusterRole", APIGroup: rbacv1.GroupName, Name: roleName},
+			Subjects: subs,
+		}
+		binding.SetNamespace(a.Namespace)
+	}
+	binding.SetName(a.Prefix + roleName + ":binding")
 	return binding
 }
 
@@ -343,8 +408,21 @@ func removeSubjects(src []rbacv1.Subject, toRemove []rbacv1.Subject) []rbacv1.Su
 	return subs
 }
 
+type opts struct {
+	replace bool
+}
+
+// WithReplace means to replace all subjects, this is only useful in Grant Privileges
+func WithReplace(o *opts) {
+	o.replace = true
+}
+
 // GrantPrivileges grant privileges to identity
-func GrantPrivileges(ctx context.Context, cli client.Client, privileges []PrivilegeDescription, identity *Identity, writer io.Writer) error {
+func GrantPrivileges(ctx context.Context, cli client.Client, privileges []PrivilegeDescription, identity *Identity, writer io.Writer, optionFuncs ...func(*opts)) error {
+	var options = &opts{}
+	for _, fc := range optionFuncs {
+		fc(options)
+	}
 	subs := identity.Subjects()
 	if len(subs) == 0 {
 		return fmt.Errorf("failed to find RBAC subjects in identity")
@@ -374,12 +452,20 @@ func GrantPrivileges(ctx context.Context, cli client.Client, privileges []Privil
 		case *rbacv1.RoleBinding:
 			obj := &rbacv1.RoleBinding{}
 			if err := cli.Get(_ctx, client.ObjectKeyFromObject(bindingObj), obj); err == nil {
-				bindingObj.Subjects = mergeSubjects(bindingObj.Subjects, obj.Subjects)
+				if options.replace {
+					bindingObj.Subjects = obj.Subjects
+				} else {
+					bindingObj.Subjects = mergeSubjects(bindingObj.Subjects, obj.Subjects)
+				}
 			}
 		case *rbacv1.ClusterRoleBinding:
 			obj := &rbacv1.ClusterRoleBinding{}
 			if err := cli.Get(_ctx, client.ObjectKeyFromObject(bindingObj), obj); err == nil {
-				bindingObj.Subjects = mergeSubjects(bindingObj.Subjects, obj.Subjects)
+				if options.replace {
+					bindingObj.Subjects = obj.Subjects
+				} else {
+					bindingObj.Subjects = mergeSubjects(bindingObj.Subjects, obj.Subjects)
+				}
 			}
 		}
 		res, err := utils.CreateOrUpdate(_ctx, cli, binding)
@@ -394,7 +480,11 @@ func GrantPrivileges(ctx context.Context, cli client.Client, privileges []Privil
 // RevokePrivileges revoke privileges (notice that the revoking process only deletes bond subject in the
 // RoleBinding/ClusterRoleBinding, it does not ensure the identity's other related privileges are removed to
 // prevent identity from accessing)
-func RevokePrivileges(ctx context.Context, cli client.Client, privileges []PrivilegeDescription, identity *Identity, writer io.Writer) error {
+func RevokePrivileges(ctx context.Context, cli client.Client, privileges []PrivilegeDescription, identity *Identity, writer io.Writer, optionFuncs ...func(*opts)) error {
+	var options = &opts{}
+	for _, fc := range optionFuncs {
+		fc(options)
+	}
 	subs := identity.Subjects()
 	if len(subs) == 0 {
 		return fmt.Errorf("failed to find RBAC subjects in identity")

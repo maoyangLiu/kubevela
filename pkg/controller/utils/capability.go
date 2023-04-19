@@ -20,20 +20,18 @@ package utils
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 
-	"cuelang.org/go/cue"
-	"cuelang.org/go/cue/build"
 	"github.com/getkin/kin-openapi/openapi3"
+	"github.com/go-git/go-git/v5"
+	gitssh "github.com/go-git/go-git/v5/plumbing/transport/ssh"
 	"github.com/pkg/errors"
-	git "gopkg.in/src-d/go-git.v4"
 	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	k8stypes "k8s.io/apimachinery/pkg/types"
 	"k8s.io/klog/v2"
 	"k8s.io/utils/pointer"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -43,9 +41,7 @@ import (
 	"github.com/oam-dev/kubevela/apis/types"
 	"github.com/oam-dev/kubevela/pkg/appfile"
 	"github.com/oam-dev/kubevela/pkg/appfile/helm"
-	velacue "github.com/oam-dev/kubevela/pkg/cue"
-	"github.com/oam-dev/kubevela/pkg/cue/model"
-	"github.com/oam-dev/kubevela/pkg/cue/packages"
+	"github.com/oam-dev/kubevela/pkg/cue/script"
 	"github.com/oam-dev/kubevela/pkg/oam/util"
 	"github.com/oam-dev/kubevela/pkg/utils/common"
 	"github.com/oam-dev/kubevela/pkg/utils/terraform"
@@ -73,6 +69,11 @@ const (
 	typeComponentDefinition    = "component"
 	typeWorkflowStepDefinition = "workflowstep"
 	typePolicyStepDefinition   = "policy"
+)
+
+const (
+	// GitCredsKnownHosts is a key in git credentials secret
+	GitCredsKnownHosts string = "known_hosts"
 )
 
 // ErrNoSectionParameterInCue means there is not parameter section in Cue template of a workload
@@ -131,12 +132,12 @@ func NewCapabilityComponentDef(componentDefinition *v1beta1.ComponentDefinition)
 }
 
 // GetOpenAPISchema gets OpenAPI v3 schema by WorkloadDefinition name
-func (def *CapabilityComponentDefinition) GetOpenAPISchema(pd *packages.PackageDiscover, name string) ([]byte, error) {
+func (def *CapabilityComponentDefinition) GetOpenAPISchema(name string) ([]byte, error) {
 	capability, err := appfile.ConvertTemplateJSON2Object(name, def.ComponentDefinition.Spec.Extension, def.ComponentDefinition.Spec.Schematic)
 	if err != nil {
 		return nil, fmt.Errorf("failed to convert ComponentDefinition to Capability Object")
 	}
-	return getOpenAPISchema(capability, pd)
+	return getOpenAPISchema(capability)
 }
 
 // GetOpenAPISchemaFromTerraformComponentDefinition gets OpenAPI v3 schema by WorkloadDefinition name
@@ -214,38 +215,41 @@ func GetOpenAPISchemaFromTerraformComponentDefinition(configuration string) ([]b
 }
 
 // GetTerraformConfigurationFromRemote gets Terraform Configuration(HCL)
-func GetTerraformConfigurationFromRemote(name, remoteURL, remotePath string) (string, error) {
-	tmpPath := filepath.Join("./tmp/terraform", name)
-	// Check if the directory exists. If yes, remove it.
-	if _, err := os.Stat(tmpPath); err == nil {
-		err := os.RemoveAll(tmpPath)
-		if err != nil {
-			return "", errors.Wrap(err, "failed to remove the directory")
-		}
-	}
-	_, err := git.PlainClone(tmpPath, false, &git.CloneOptions{
-		URL:      remoteURL,
-		Progress: nil,
-	})
+func GetTerraformConfigurationFromRemote(name, remoteURL, remotePath string, sshPublicKey *gitssh.PublicKeys) (string, error) {
+	userHome, err := os.UserHomeDir()
 	if err != nil {
 		return "", err
 	}
+	cachePath := filepath.Join(userHome, ".vela", "terraform", name)
+	// Check if the directory exists. If yes, remove it.
+	entities, err := os.ReadDir(cachePath)
+	if err != nil || len(entities) == 0 {
+		fmt.Printf("loading terraform module %s into %s from %s\n", name, cachePath, remoteURL)
+		cloneOptions := &git.CloneOptions{
+			URL:      remoteURL,
+			Progress: os.Stdout,
+		}
+		if sshPublicKey != nil {
+			cloneOptions.Auth = sshPublicKey
+		}
+		if _, err = git.PlainClone(cachePath, false, cloneOptions); err != nil {
+			return "", err
+		}
+	}
+	sshKnownHostsPath := os.Getenv("SSH_KNOWN_HOSTS")
+	_ = os.Remove(sshKnownHostsPath)
 
-	tfPath := filepath.Join(tmpPath, remotePath, "variables.tf")
+	tfPath := filepath.Join(cachePath, remotePath, "variables.tf")
 	if _, err := os.Stat(tfPath); err != nil {
-		tfPath = filepath.Join(tmpPath, remotePath, "main.tf")
+		tfPath = filepath.Join(cachePath, remotePath, "main.tf")
 		if _, err := os.Stat(tfPath); err != nil {
 			return "", errors.Wrap(err, "failed to find main.tf or variables.tf in Terraform configurations of the remote repository")
 		}
 	}
-	conf, err := ioutil.ReadFile(filepath.Clean(tfPath))
+	conf, err := os.ReadFile(filepath.Clean(tfPath))
 	if err != nil {
 		return "", errors.Wrap(err, "failed to read Terraform configuration")
 	}
-	if err := os.RemoveAll(tmpPath); err != nil {
-		return "", err
-	}
-
 	return string(conf), nil
 }
 
@@ -356,9 +360,46 @@ func GetKubeSchematicOpenAPISchema(params []commontypes.KubeParameter) ([]byte, 
 	return generateJSONSchemaWithRequiredProperty(properties, required)
 }
 
+// GetGitSSHPublicKey gets a kubernetes secret containing the SSH private key based on gitCredentialsSecretReference parameters for component and trait definition
+func GetGitSSHPublicKey(ctx context.Context, k8sClient client.Client, gitCredentialsSecretReference *v1.SecretReference) (*gitssh.PublicKeys, error) {
+	gitCredentialsSecretName := gitCredentialsSecretReference.Name
+	gitCredentialsSecretNamespace := gitCredentialsSecretReference.Namespace
+	gitCredentialsNamespacedName := k8stypes.NamespacedName{Namespace: gitCredentialsSecretNamespace, Name: gitCredentialsSecretName}
+
+	secret := &v1.Secret{}
+	err := k8sClient.Get(ctx, gitCredentialsNamespacedName, secret)
+	if err != nil {
+		return nil, fmt.Errorf("failed to  get git credentials secret: %w", err)
+	}
+	needSecretKeys := []string{GitCredsKnownHosts, v1.SSHAuthPrivateKey}
+	for _, key := range needSecretKeys {
+		if _, ok := secret.Data[key]; !ok {
+			err := errors.Errorf("'%s' not in git credentials secret", key)
+			return nil, err
+		}
+	}
+
+	klog.InfoS("Reconcile gitCredentialsSecretReference", "gitCredentialsSecretReference", klog.KRef(gitCredentialsSecretNamespace, gitCredentialsSecretName))
+
+	sshPrivateKey := secret.Data[v1.SSHAuthPrivateKey]
+	publicKey, err := gitssh.NewPublicKeys("git", sshPrivateKey, "")
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate public key from private key: %w", err)
+	}
+	sshKnownHosts := secret.Data[GitCredsKnownHosts]
+	sshDir := filepath.Join(os.TempDir(), ".ssh")
+	sshKnownHostsPath := filepath.Join(sshDir, GitCredsKnownHosts)
+	_ = os.Mkdir(sshDir, 0700)
+	err = os.WriteFile(sshKnownHostsPath, sshKnownHosts, 0600)
+	if err != nil {
+		return nil, fmt.Errorf("failed to write known hosts into file: %w", err)
+	}
+	_ = os.Setenv("SSH_KNOWN_HOSTS", sshKnownHostsPath)
+	return publicKey, nil
+}
+
 // StoreOpenAPISchema stores OpenAPI v3 schema in ConfigMap from WorkloadDefinition
-func (def *CapabilityComponentDefinition) StoreOpenAPISchema(ctx context.Context, k8sClient client.Client,
-	pd *packages.PackageDiscover, namespace, name, revName string) (string, error) {
+func (def *CapabilityComponentDefinition) StoreOpenAPISchema(ctx context.Context, k8sClient client.Client, namespace, name, revName string) (string, error) {
 	var jsonSchema []byte
 	var err error
 	switch def.WorkloadType {
@@ -372,14 +413,23 @@ func (def *CapabilityComponentDefinition) StoreOpenAPISchema(ctx context.Context
 		}
 		configuration := def.Terraform.Configuration
 		if def.Terraform.Type == "remote" {
-			configuration, err = GetTerraformConfigurationFromRemote(def.Name, def.Terraform.Configuration, def.Terraform.Path)
+			var publicKey *gitssh.PublicKeys
+			publicKey = nil
+			if def.Terraform.GitCredentialsSecretReference != nil {
+				gitCredentialsSecretReference := def.Terraform.GitCredentialsSecretReference
+				publicKey, err = GetGitSSHPublicKey(ctx, k8sClient, gitCredentialsSecretReference)
+				if err != nil {
+					return "", fmt.Errorf("issue with gitCredentialsSecretReference %s/%s: %w", gitCredentialsSecretReference.Namespace, gitCredentialsSecretReference.Name, err)
+				}
+			}
+			configuration, err = GetTerraformConfigurationFromRemote(def.Name, def.Terraform.Configuration, def.Terraform.Path, publicKey)
 			if err != nil {
 				return "", fmt.Errorf("cannot get Terraform configuration %s from remote: %w", def.Name, err)
 			}
 		}
 		jsonSchema, err = GetOpenAPISchemaFromTerraformComponentDefinition(configuration)
 	default:
-		jsonSchema, err = def.GetOpenAPISchema(pd, name)
+		jsonSchema, err = def.GetOpenAPISchema(name)
 	}
 	if err != nil {
 		return "", fmt.Errorf("failed to generate OpenAPI v3 JSON schema for capability %s: %w", def.Name, err)
@@ -390,8 +440,8 @@ func (def *CapabilityComponentDefinition) StoreOpenAPISchema(ctx context.Context
 		Kind:               componentDefinition.Kind,
 		Name:               componentDefinition.Name,
 		UID:                componentDefinition.GetUID(),
-		Controller:         pointer.BoolPtr(true),
-		BlockOwnerDeletion: pointer.BoolPtr(true),
+		Controller:         pointer.Bool(true),
+		BlockOwnerDeletion: pointer.Bool(true),
 	}}
 	cmName, err := def.CreateOrUpdateConfigMap(ctx, k8sClient, namespace, componentDefinition.Name, typeComponentDefinition, componentDefinition.Labels, nil, jsonSchema, ownerReference)
 	if err != nil {
@@ -408,8 +458,8 @@ func (def *CapabilityComponentDefinition) StoreOpenAPISchema(ctx context.Context
 		Kind:               defRev.Kind,
 		Name:               defRev.Name,
 		UID:                defRev.GetUID(),
-		Controller:         pointer.BoolPtr(true),
-		BlockOwnerDeletion: pointer.BoolPtr(true),
+		Controller:         pointer.Bool(true),
+		BlockOwnerDeletion: pointer.Bool(true),
 	}}
 	_, err = def.CreateOrUpdateConfigMap(ctx, k8sClient, namespace, revName, typeComponentDefinition, defRev.Spec.ComponentDefinition.Labels, nil, jsonSchema, ownerReference)
 	if err != nil {
@@ -443,23 +493,23 @@ func NewCapabilityTraitDef(traitdefinition *v1beta1.TraitDefinition) CapabilityT
 }
 
 // GetOpenAPISchema gets OpenAPI v3 schema by TraitDefinition name
-func (def *CapabilityTraitDefinition) GetOpenAPISchema(pd *packages.PackageDiscover, name string) ([]byte, error) {
+func (def *CapabilityTraitDefinition) GetOpenAPISchema(name string) ([]byte, error) {
 	capability, err := appfile.ConvertTemplateJSON2Object(name, def.TraitDefinition.Spec.Extension, def.TraitDefinition.Spec.Schematic)
 	if err != nil {
 		return nil, fmt.Errorf("failed to convert WorkloadDefinition to Capability Object")
 	}
-	return getOpenAPISchema(capability, pd)
+	return getOpenAPISchema(capability)
 }
 
 // StoreOpenAPISchema stores OpenAPI v3 schema from TraitDefinition in ConfigMap
-func (def *CapabilityTraitDefinition) StoreOpenAPISchema(ctx context.Context, k8sClient client.Client, pd *packages.PackageDiscover, namespace, name string, revName string) (string, error) {
+func (def *CapabilityTraitDefinition) StoreOpenAPISchema(ctx context.Context, k8sClient client.Client, namespace, name string, revName string) (string, error) {
 	var jsonSchema []byte
 	var err error
 	switch def.DefCategoryType {
 	case util.KubeDef: // Kube template
 		jsonSchema, err = GetKubeSchematicOpenAPISchema(def.Kube.Parameters)
 	default: // CUE  template
-		jsonSchema, err = def.GetOpenAPISchema(pd, name)
+		jsonSchema, err = def.GetOpenAPISchema(name)
 	}
 	if err != nil {
 		return "", fmt.Errorf("failed to generate OpenAPI v3 JSON schema for capability %s: %w", def.Name, err)
@@ -471,8 +521,8 @@ func (def *CapabilityTraitDefinition) StoreOpenAPISchema(ctx context.Context, k8
 		Kind:               traitDefinition.Kind,
 		Name:               traitDefinition.Name,
 		UID:                traitDefinition.GetUID(),
-		Controller:         pointer.BoolPtr(true),
-		BlockOwnerDeletion: pointer.BoolPtr(true),
+		Controller:         pointer.Bool(true),
+		BlockOwnerDeletion: pointer.Bool(true),
 	}}
 	cmName, err := def.CreateOrUpdateConfigMap(ctx, k8sClient, namespace, traitDefinition.Name, typeTraitDefinition, traitDefinition.Labels, traitDefinition.Spec.AppliesToWorkloads, jsonSchema, ownerReference)
 	if err != nil {
@@ -489,8 +539,8 @@ func (def *CapabilityTraitDefinition) StoreOpenAPISchema(ctx context.Context, k8
 		Kind:               defRev.Kind,
 		Name:               defRev.Name,
 		UID:                defRev.GetUID(),
-		Controller:         pointer.BoolPtr(true),
-		BlockOwnerDeletion: pointer.BoolPtr(true),
+		Controller:         pointer.Bool(true),
+		BlockOwnerDeletion: pointer.Bool(true),
 	}}
 	_, err = def.CreateOrUpdateConfigMap(ctx, k8sClient, namespace, revName, typeTraitDefinition, defRev.Spec.TraitDefinition.Labels, defRev.Spec.TraitDefinition.Spec.AppliesToWorkloads, jsonSchema, ownerReference)
 	if err != nil {
@@ -516,20 +566,20 @@ func NewCapabilityStepDef(stepdefinition *v1beta1.WorkflowStepDefinition) Capabi
 }
 
 // GetOpenAPISchema gets OpenAPI v3 schema by StepDefinition name
-func (def *CapabilityStepDefinition) GetOpenAPISchema(pd *packages.PackageDiscover, name string) ([]byte, error) {
+func (def *CapabilityStepDefinition) GetOpenAPISchema(name string) ([]byte, error) {
 	capability, err := appfile.ConvertTemplateJSON2Object(name, nil, def.StepDefinition.Spec.Schematic)
 	if err != nil {
 		return nil, fmt.Errorf("failed to convert WorkflowStepDefinition to Capability Object")
 	}
-	return getOpenAPISchema(capability, pd)
+	return getOpenAPISchema(capability)
 }
 
 // StoreOpenAPISchema stores OpenAPI v3 schema from StepDefinition in ConfigMap
-func (def *CapabilityStepDefinition) StoreOpenAPISchema(ctx context.Context, k8sClient client.Client, pd *packages.PackageDiscover, namespace, name string, revName string) (string, error) {
+func (def *CapabilityStepDefinition) StoreOpenAPISchema(ctx context.Context, k8sClient client.Client, namespace, name string, revName string) (string, error) {
 	var jsonSchema []byte
 	var err error
 
-	jsonSchema, err = def.GetOpenAPISchema(pd, name)
+	jsonSchema, err = def.GetOpenAPISchema(name)
 	if err != nil {
 		return "", fmt.Errorf("failed to generate OpenAPI v3 JSON schema for capability %s: %w", def.Name, err)
 	}
@@ -540,8 +590,8 @@ func (def *CapabilityStepDefinition) StoreOpenAPISchema(ctx context.Context, k8s
 		Kind:               stepDefinition.Kind,
 		Name:               stepDefinition.Name,
 		UID:                stepDefinition.GetUID(),
-		Controller:         pointer.BoolPtr(true),
-		BlockOwnerDeletion: pointer.BoolPtr(true),
+		Controller:         pointer.Bool(true),
+		BlockOwnerDeletion: pointer.Bool(true),
 	}}
 	cmName, err := def.CreateOrUpdateConfigMap(ctx, k8sClient, namespace, stepDefinition.Name, typeWorkflowStepDefinition, stepDefinition.Labels, nil, jsonSchema, ownerReference)
 	if err != nil {
@@ -558,8 +608,8 @@ func (def *CapabilityStepDefinition) StoreOpenAPISchema(ctx context.Context, k8s
 		Kind:               defRev.Kind,
 		Name:               defRev.Name,
 		UID:                defRev.GetUID(),
-		Controller:         pointer.BoolPtr(true),
-		BlockOwnerDeletion: pointer.BoolPtr(true),
+		Controller:         pointer.Bool(true),
+		BlockOwnerDeletion: pointer.Bool(true),
 	}}
 	_, err = def.CreateOrUpdateConfigMap(ctx, k8sClient, namespace, revName, typeWorkflowStepDefinition, defRev.Spec.WorkflowStepDefinition.Labels, nil, jsonSchema, ownerReference)
 	if err != nil {
@@ -585,21 +635,20 @@ func NewCapabilityPolicyDef(policydefinition *v1beta1.PolicyDefinition) Capabili
 }
 
 // GetOpenAPISchema gets OpenAPI v3 schema by StepDefinition name
-func (def *CapabilityPolicyDefinition) GetOpenAPISchema(pd *packages.PackageDiscover, name string) ([]byte, error) {
+func (def *CapabilityPolicyDefinition) GetOpenAPISchema(name string) ([]byte, error) {
 	capability, err := appfile.ConvertTemplateJSON2Object(name, nil, def.PolicyDefinition.Spec.Schematic)
 	if err != nil {
 		return nil, fmt.Errorf("failed to convert WorkflowStepDefinition to Capability Object")
 	}
-	return getOpenAPISchema(capability, pd)
+	return getOpenAPISchema(capability)
 }
 
 // StoreOpenAPISchema stores OpenAPI v3 schema from StepDefinition in ConfigMap
-func (def *CapabilityPolicyDefinition) StoreOpenAPISchema(ctx context.Context, k8sClient client.Client,
-	pd *packages.PackageDiscover, namespace, name, revName string) (string, error) {
+func (def *CapabilityPolicyDefinition) StoreOpenAPISchema(ctx context.Context, k8sClient client.Client, namespace, name, revName string) (string, error) {
 	var jsonSchema []byte
 	var err error
 
-	jsonSchema, err = def.GetOpenAPISchema(pd, name)
+	jsonSchema, err = def.GetOpenAPISchema(name)
 	if err != nil {
 		return "", fmt.Errorf("failed to generate OpenAPI v3 JSON schema for capability %s: %w", def.Name, err)
 	}
@@ -610,8 +659,8 @@ func (def *CapabilityPolicyDefinition) StoreOpenAPISchema(ctx context.Context, k
 		Kind:               policyDefinition.Kind,
 		Name:               policyDefinition.Name,
 		UID:                policyDefinition.GetUID(),
-		Controller:         pointer.BoolPtr(true),
-		BlockOwnerDeletion: pointer.BoolPtr(true),
+		Controller:         pointer.Bool(true),
+		BlockOwnerDeletion: pointer.Bool(true),
 	}}
 	cmName, err := def.CreateOrUpdateConfigMap(ctx, k8sClient, namespace, policyDefinition.Name, typePolicyStepDefinition, policyDefinition.Labels, nil, jsonSchema, ownerReference)
 	if err != nil {
@@ -628,8 +677,8 @@ func (def *CapabilityPolicyDefinition) StoreOpenAPISchema(ctx context.Context, k
 		Kind:               defRev.Kind,
 		Name:               defRev.Name,
 		UID:                defRev.GetUID(),
-		Controller:         pointer.BoolPtr(true),
-		BlockOwnerDeletion: pointer.BoolPtr(true),
+		Controller:         pointer.Bool(true),
+		BlockOwnerDeletion: pointer.Bool(true),
 	}}
 	_, err = def.CreateOrUpdateConfigMap(ctx, k8sClient, namespace, revName, typePolicyStepDefinition, defRev.Spec.PolicyDefinition.Labels, nil, jsonSchema, ownerReference)
 	if err != nil {
@@ -697,130 +746,16 @@ func (def *CapabilityBaseDefinition) CreateOrUpdateConfigMap(ctx context.Context
 }
 
 // getOpenAPISchema is the main function for GetDefinition API
-func getOpenAPISchema(capability types.Capability, pd *packages.PackageDiscover) ([]byte, error) {
-	openAPISchema, err := generateOpenAPISchemaFromCapabilityParameter(capability, pd)
+func getOpenAPISchema(capability types.Capability) ([]byte, error) {
+	cueTemplate := script.CUE([]byte(capability.CueTemplate))
+	schema, err := cueTemplate.ParsePropertiesToSchema()
 	if err != nil {
 		return nil, err
 	}
-	schema, err := ConvertOpenAPISchema2SwaggerObject(openAPISchema)
-	if err != nil {
-		return nil, err
-	}
-	FixOpenAPISchema("", schema)
-
+	klog.Infof("parsed %d properties by %s/%s", len(schema.Properties), capability.Type, capability.Name)
 	parameter, err := schema.MarshalJSON()
 	if err != nil {
 		return nil, err
 	}
 	return parameter, nil
-}
-
-// generateOpenAPISchemaFromCapabilityParameter returns the parameter of a definition in cue.Value format
-func generateOpenAPISchemaFromCapabilityParameter(capability types.Capability, pd *packages.PackageDiscover) ([]byte, error) {
-	template, err := PrepareParameterCue(capability.Name, capability.CueTemplate)
-	if err != nil {
-		if errors.As(err, &ErrNoSectionParameterInCue{}) {
-			// return OpenAPI with empty object parameter, making it possible to generate ConfigMap
-			var r cue.Runtime
-			cueInst, _ := r.Compile("-", "")
-			return common.GenOpenAPI(cueInst)
-		}
-		return nil, err
-	}
-
-	template += velacue.BaseTemplate
-	if pd == nil {
-		var r cue.Runtime
-		cueInst, err := r.Compile("-", template)
-		if err != nil {
-			return nil, err
-		}
-		return common.GenOpenAPI(cueInst)
-	}
-	bi := build.NewContext().NewInstance("", nil)
-	err = bi.AddFile("-", template)
-	if err != nil {
-		return nil, err
-	}
-
-	cueInst, err := pd.ImportPackagesAndBuildInstance(bi)
-	if err != nil {
-		return nil, err
-	}
-	return common.GenOpenAPI(cueInst)
-}
-
-// GenerateOpenAPISchemaFromDefinition returns the parameter of a definition
-func GenerateOpenAPISchemaFromDefinition(definitionName, cueTemplate string) ([]byte, error) {
-	capability := types.Capability{
-		Name:        definitionName,
-		CueTemplate: cueTemplate,
-	}
-	return generateOpenAPISchemaFromCapabilityParameter(capability, nil)
-}
-
-// PrepareParameterCue cuts `parameter` section form definition .cue file
-func PrepareParameterCue(capabilityName, capabilityTemplate string) (string, error) {
-	var template string
-	var withParameterFlag bool
-	r := regexp.MustCompile(`[[:space:]]*parameter:[[:space:]]*`)
-	trimRe := regexp.MustCompile(`\s+`)
-
-	for _, text := range strings.Split(capabilityTemplate, "\n") {
-		if r.MatchString(text) {
-			// a variable has to be refined as a definition which starts with "#"
-			// text may be start with space or tab, we should clean up text
-			text = fmt.Sprintf("parameter: #parameter\n#%s", trimRe.ReplaceAllString(text, ""))
-			withParameterFlag = true
-		}
-		template += fmt.Sprintf("%s\n", text)
-	}
-
-	if !withParameterFlag {
-		return "", ErrNoSectionParameterInCue{capName: capabilityName}
-	}
-	return template, nil
-}
-
-// FixOpenAPISchema fixes tainted `description` filed, missing of title `field`.
-func FixOpenAPISchema(name string, schema *openapi3.Schema) {
-	t := schema.Type
-	switch t {
-	case "object":
-		for k, v := range schema.Properties {
-			s := v.Value
-			FixOpenAPISchema(k, s)
-		}
-	case "array":
-		if schema.Items != nil {
-			FixOpenAPISchema("", schema.Items.Value)
-		}
-	}
-	if name != "" {
-		schema.Title = name
-	}
-
-	description := schema.Description
-	if strings.Contains(description, appfile.UsageTag) {
-		description = strings.Split(description, appfile.UsageTag)[1]
-	}
-	if strings.Contains(description, appfile.ShortTag) {
-		description = strings.Split(description, appfile.ShortTag)[0]
-		description = strings.TrimSpace(description)
-	}
-	schema.Description = description
-}
-
-// ConvertOpenAPISchema2SwaggerObject converts OpenAPI v2 JSON schema to Swagger Object
-func ConvertOpenAPISchema2SwaggerObject(data []byte) (*openapi3.Schema, error) {
-	swagger, err := openapi3.NewLoader().LoadFromData(data)
-	if err != nil {
-		return nil, err
-	}
-
-	schemaRef, ok := swagger.Components.Schemas[model.ParameterFieldName]
-	if !ok {
-		return nil, errors.New(util.ErrGenerateOpenAPIV2JSONSchemaForCapability)
-	}
-	return schemaRef.Value, nil
 }

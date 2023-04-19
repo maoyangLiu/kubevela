@@ -21,16 +21,20 @@ import (
 	"fmt"
 
 	"github.com/crossplane/crossplane-runtime/pkg/meta"
+	"github.com/kubevela/pkg/controller/sharding"
+	"github.com/kubevela/pkg/util/compression"
 	"github.com/pkg/errors"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	"github.com/oam-dev/kubevela/apis/core.oam.dev/common"
 	"github.com/oam-dev/kubevela/apis/core.oam.dev/v1beta1"
+	"github.com/oam-dev/kubevela/pkg/cache"
+	"github.com/oam-dev/kubevela/pkg/features"
 	"github.com/oam-dev/kubevela/pkg/monitor/metrics"
 	"github.com/oam-dev/kubevela/pkg/oam"
 	velaerrors "github.com/oam-dev/kubevela/pkg/utils/errors"
@@ -89,6 +93,14 @@ func createResourceTracker(ctx context.Context, cli client.Client, app *v1beta1.
 	} else {
 		rt.Spec.ApplicationGeneration = 0
 	}
+	if utilfeature.DefaultMutableFeatureGate.Enabled(features.GzipResourceTracker) {
+		rt.Spec.Compression.Type = compression.Gzip
+	}
+	// zstd compressor will have higher priority when both gzip and zstd are enabled.
+	if utilfeature.DefaultMutableFeatureGate.Enabled(features.ZstdResourceTracker) {
+		rt.Spec.Compression.Type = compression.Zstd
+	}
+	sharding.PropagateScheduledShardIDLabel(app, rt)
 	if err := cli.Create(ctx, rt); err != nil {
 		return nil, err
 	}
@@ -130,10 +142,15 @@ func newResourceTrackerFromApplicationResourceTracker(appRt *unstructured.Unstru
 
 func listApplicationResourceTrackers(ctx context.Context, cli client.Client, app *v1beta1.Application) ([]v1beta1.ResourceTracker, error) {
 	rts := v1beta1.ResourceTrackerList{}
-	err := cli.List(ctx, &rts, client.MatchingLabels{
-		oam.LabelAppName:      app.Name,
-		oam.LabelAppNamespace: app.Namespace,
-	})
+	var err error
+	if cache.OptimizeListOp {
+		err = cli.List(ctx, &rts, client.MatchingFields{cache.AppIndex: app.Namespace + "/" + app.Name})
+	} else {
+		err = cli.List(ctx, &rts, client.MatchingLabels{
+			oam.LabelAppName:      app.Name,
+			oam.LabelAppNamespace: app.Namespace,
+		})
+	}
 	if err == nil {
 		return rts.Items, nil
 	}
@@ -163,6 +180,10 @@ func listApplicationResourceTrackers(ctx context.Context, cli client.Client, app
 }
 
 // ListApplicationResourceTrackers list resource trackers for application with all historyRTs sorted by version number
+// rootRT -> The ResourceTracker that records life-long resources. These resources will only be recycled when application is removed.
+// currentRT -> The ResourceTracker that tracks the resources used by the latest version of application.
+// historyRTs -> The ResourceTrackers that tracks the resources in outdated versions.
+// crRT -> The ResourceTracker that tracks the component revisions created by the application.
 func ListApplicationResourceTrackers(ctx context.Context, cli client.Client, app *v1beta1.Application) (rootRT *v1beta1.ResourceTracker, currentRT *v1beta1.ResourceTracker, historyRTs []*v1beta1.ResourceTracker, crRT *v1beta1.ResourceTracker, err error) {
 	metrics.ListResourceTrackerCounter.WithLabelValues("application").Inc()
 	rts, err := listApplicationResourceTrackers(ctx, cli, app)
@@ -209,12 +230,16 @@ func RecordManifestsInResourceTracker(
 	rt *v1beta1.ResourceTracker,
 	manifests []*unstructured.Unstructured,
 	metaOnly bool,
-	creator common.ResourceCreatorRole) error {
+	skipGC bool,
+	creator string) error {
 	if len(manifests) != 0 {
+		updated := false
 		for _, manifest := range manifests {
-			rt.AddManagedResource(manifest, metaOnly, creator)
+			updated = rt.AddManagedResource(manifest, metaOnly, skipGC, creator) || updated
 		}
-		return cli.Update(ctx, rt)
+		if updated {
+			return cli.Update(ctx, rt)
+		}
 	}
 	return nil
 }

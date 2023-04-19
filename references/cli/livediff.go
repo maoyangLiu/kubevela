@@ -37,7 +37,9 @@ import (
 
 // LiveDiffCmdOptions contains the live-diff cmd options
 type LiveDiffCmdOptions struct {
-	DryRunCmdOptions
+	cmdutil.IOStreams
+	ApplicationFile   string
+	DefinitionFile    string
 	AppName           string
 	Namespace         string
 	Revision          string
@@ -47,10 +49,8 @@ type LiveDiffCmdOptions struct {
 
 // NewLiveDiffCommand creates `live-diff` command
 func NewLiveDiffCommand(c common.Args, order string, ioStreams cmdutil.IOStreams) *cobra.Command {
-	o := &LiveDiffCmdOptions{
-		DryRunCmdOptions: DryRunCmdOptions{
-			IOStreams: ioStreams,
-		}}
+	o := &LiveDiffCmdOptions{IOStreams: ioStreams}
+
 	cmd := &cobra.Command{
 		Use:                   "live-diff",
 		DisableFlagsInUseLine: true,
@@ -104,7 +104,7 @@ func LiveDiffApplication(cmdOption *LiveDiffCmdOptions, c common.Args) (bytes.Bu
 	}
 	objs := []oam.Object{}
 	if cmdOption.DefinitionFile != "" {
-		objs, err = ReadObjectsFromFile(cmdOption.DefinitionFile)
+		objs, err = ReadDefinitionsFromFile(cmdOption.DefinitionFile)
 		if err != nil {
 			return buff, err
 		}

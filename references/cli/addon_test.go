@@ -18,21 +18,19 @@ package cli
 
 import (
 	"fmt"
-	"strings"
+	"os"
 	"testing"
-
-	"github.com/fatih/color"
-
-	pkgaddon "github.com/oam-dev/kubevela/pkg/addon"
-
-	"github.com/getkin/kin-openapi/openapi3"
-
-	"github.com/oam-dev/kubevela/pkg/utils/common"
-	"github.com/oam-dev/kubevela/pkg/utils/util"
 
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
-	"gotest.tools/assert"
+
+	"github.com/fatih/color"
+	"github.com/getkin/kin-openapi/openapi3"
+	"github.com/stretchr/testify/assert"
+
+	pkgaddon "github.com/oam-dev/kubevela/pkg/addon"
+	"github.com/oam-dev/kubevela/pkg/utils/common"
+	"github.com/oam-dev/kubevela/pkg/utils/util"
 )
 
 func TestParseMap(t *testing.T) {
@@ -92,8 +90,8 @@ func TestParseMap(t *testing.T) {
 	for _, s := range testcase {
 		r, err := parseAddonArgsToMap(s.args)
 		if s.nilError {
-			assert.NilError(t, err)
-			assert.DeepEqual(t, s.res, r)
+			assert.NoError(t, err)
+			assert.Equal(t, s.res, r)
 		} else {
 			assert.Error(t, err, fmt.Sprintf("%v should be error case", s.args))
 		}
@@ -118,6 +116,7 @@ func TestAddonEnableCmdWithErrLocalPath(t *testing.T) {
 	ioStream := util.IOStreams{}
 	commandArgs := common.Args{}
 	cmd := NewAddonEnableCommand(commandArgs, ioStream)
+	initCommand(cmd)
 
 	for _, s := range testcase {
 		cmd.SetArgs(s.args)
@@ -136,6 +135,7 @@ func testAddonRegistryAddCmd() {
 	testcase := []struct {
 		args   []string
 		errMsg string
+		result *pkgaddon.Registry
 	}{
 		{
 			args:   []string{"noAuthRegistry", "--type=helm", "--endpoint=http://127.0.0.1/chartrepo/oam"},
@@ -144,6 +144,9 @@ func testAddonRegistryAddCmd() {
 		{
 			args:   []string{"basicAuthRegistry", "--type=helm", "--endpoint=http://127.0.0.1/chartrepo/oam", "--username=hello", "--password=word"},
 			errMsg: "fail to add basis auth addon registry",
+		},
+		{
+			args: []string{"skipTlsRegistry", "--type=helm", "--endpoint=https://127.0.0.1/chartrepo/oam", "--insecureSkipTLS=true"},
 		},
 	}
 
@@ -156,7 +159,7 @@ func testAddonRegistryAddCmd() {
 	for _, s := range testcase {
 		cmd.SetArgs(s.args)
 		err := cmd.Execute()
-		Expect(err).Should(BeNil(), s.errMsg)
+		Expect(err).To(HaveOccurred())
 	}
 }
 
@@ -178,6 +181,7 @@ func TestAddonUpgradeCmdWithErrLocalPath(t *testing.T) {
 	ioStream := util.IOStreams{}
 	commandArgs := common.Args{}
 	cmd := NewAddonUpgradeCommand(commandArgs, ioStream)
+	initCommand(cmd)
 
 	for _, s := range testcase {
 		cmd.SetArgs(s.args)
@@ -189,23 +193,23 @@ func TestAddonUpgradeCmdWithErrLocalPath(t *testing.T) {
 func TestTransCluster(t *testing.T) {
 	testcase := []struct {
 		str string
-		res []string
+		res []interface{}
 	}{
 		{
 			str: "{cluster1, cluster2}",
-			res: []string{"cluster1", "cluster2"},
+			res: []interface{}{"cluster1", "cluster2"},
 		},
 		{
 			str: "{cluster1,cluster2}",
-			res: []string{"cluster1", "cluster2"},
+			res: []interface{}{"cluster1", "cluster2"},
 		},
 		{
 			str: "{cluster1,  cluster2   }",
-			res: []string{"cluster1", "cluster2"},
+			res: []interface{}{"cluster1", "cluster2"},
 		},
 	}
 	for _, s := range testcase {
-		assert.DeepEqual(t, transClusters(s.str), s.res)
+		assert.Equal(t, transClusters(s.str), s.res)
 	}
 }
 
@@ -338,7 +342,10 @@ func TestPackageValidAddon(t *testing.T) {
 	cmd := NewAddonPackageCommand(commandArgs)
 	cmd.SetArgs([]string{"./test-data/addon/sample"})
 	err := cmd.Execute()
-	assert.NilError(t, err)
+	assert.NoError(t, err)
+	defer func() {
+		_ = os.RemoveAll("sample-1.0.1.tgz")
+	}()
 }
 
 func TestGenerateParameterString(t *testing.T) {
@@ -374,13 +381,13 @@ func TestGenerateParameterString(t *testing.T) {
 						"dbURL": &openapi3.SchemaRef{
 							Value: &openapi3.Schema{
 								Description: "Specify the MongoDB URL. it only enabled where DB type is MongoDB.",
-								Default:     nil,
+								Default:     "abc.com",
 							},
 						},
 						"dbType": &openapi3.SchemaRef{
 							Value: &openapi3.Schema{
 								Description: "Specify the database type, current support KubeAPI(default) and MongoDB.",
-								Default:     "kubeapi",
+								Enum:        []interface{}{"kubeapi", "mongodb"},
 							},
 						},
 					},
@@ -391,18 +398,19 @@ func TestGenerateParameterString(t *testing.T) {
 				color.New(color.FgCyan).Sprintf("-> ") +
 					color.New(color.Bold).Sprint("dbType") + ": " +
 					"Specify the database type, current support KubeAPI(default) and MongoDB.\n" +
-					"\tcurrent: " + color.New(color.FgGreen).Sprint("\"kubeapi\"\n") +
-					"\tdefault: " + "\"kubeapi\"\n" +
-					"\trequired: " + color.GreenString("✔\n"),
+					"\tcurrent value: " + color.New(color.FgGreen).Sprint("\"kubeapi\"\n") +
+					"\trequired: " + color.GreenString("✔\n") +
+					"\toptions: \"kubeapi\", \"mongodb\"\n",
 				// dbURL
 				color.New(color.FgCyan).Sprintf("-> ") +
 					color.New(color.Bold).Sprint("dbURL") + ": " +
-					"Specify the MongoDB URL. it only enabled where DB type is MongoDB.",
+					"Specify the MongoDB URL. it only enabled where DB type is MongoDB.\n" +
+					"\tdefault: " + "\"abc.com\"\n",
 				// database
 				color.New(color.FgCyan).Sprintf("-> ") +
 					color.New(color.Bold).Sprint("database") + ": " +
 					"Specify the database name, for the kubeapi db type, it represents namespace.\n" +
-					"\tcurrent: " + color.New(color.FgGreen).Sprint("\"kubevela\""),
+					"\tcurrent value: " + color.New(color.FgGreen).Sprint("\"kubevela\""),
 			},
 		},
 	}
@@ -410,8 +418,64 @@ func TestGenerateParameterString(t *testing.T) {
 	for _, s := range testcase {
 		res := generateParameterString(s.status, s.addonPackage)
 		for _, o := range s.outputs {
-			assert.Check(t, strings.Contains(res, o))
+			assert.Contains(t, res, o)
 		}
 
+	}
+}
+
+func TestNewAddonCreateCommand(t *testing.T) {
+	cmd := NewAddonInitCommand()
+	cmd.SetArgs([]string{})
+	err := cmd.Execute()
+	assert.ErrorContains(t, err, "required")
+
+	cmd.SetArgs([]string{"--chart", "a", "--helm-repo", "https://some.com", "--chart-version", "c"})
+	err = cmd.Execute()
+	assert.ErrorContains(t, err, "required")
+
+	cmd.SetArgs([]string{"test-addon", "--chart", "a", "--helm-repo", "https://some.com", "--chart-version", "c"})
+	err = cmd.Execute()
+	assert.NoError(t, err)
+	_ = os.RemoveAll("test-addon")
+
+	cmd.SetArgs([]string{"test-addon"})
+	err = cmd.Execute()
+	assert.NoError(t, err)
+	_ = os.RemoveAll("test-addon")
+
+}
+
+func TestCheckSpecifyRegistry(t *testing.T) {
+	testCases := []struct {
+		name      string
+		registry  string
+		addonName string
+		hasError  bool
+	}{
+		{
+			name:      "fluxcd",
+			registry:  "",
+			addonName: "fluxcd",
+			hasError:  false,
+		},
+		{
+			name:      "kubevela/fluxcd",
+			registry:  "kubevela",
+			addonName: "fluxcd",
+			hasError:  false,
+		},
+		{
+			name:      "test/kubevela/fluxcd",
+			registry:  "",
+			addonName: "",
+			hasError:  true,
+		},
+	}
+	for _, testCase := range testCases {
+		r, n, err := splitSpecifyRegistry(testCase.name)
+		assert.Equal(t, err != nil, testCase.hasError)
+		assert.Equal(t, r, testCase.registry)
+		assert.Equal(t, n, testCase.addonName)
 	}
 }

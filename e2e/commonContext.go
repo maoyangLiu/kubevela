@@ -84,6 +84,30 @@ var (
 		})
 	}
 
+	JsonAppFileContextWithWait = func(context, jsonAppFile string) bool {
+		return ginkgo.Context(context, func() {
+			ginkgo.It("Start the application through the app file in JSON format.", func() {
+				writeStatus := os.WriteFile("vela.json", []byte(jsonAppFile), 0644)
+				gomega.Expect(writeStatus).NotTo(gomega.HaveOccurred())
+				output, err := Exec("vela up -f vela.json --wait")
+				gomega.Expect(err).NotTo(gomega.HaveOccurred())
+				gomega.Expect(output).To(gomega.ContainSubstring("Application Deployed Successfully!"))
+			})
+		})
+	}
+
+	JsonAppFileContextWithTimeout = func(context, jsonAppFile, duration string) bool {
+		return ginkgo.Context(context, func() {
+			ginkgo.It("Start the application through the app file in JSON format.", func() {
+				writeStatus := os.WriteFile("vela.json", []byte(jsonAppFile), 0644)
+				gomega.Expect(writeStatus).NotTo(gomega.HaveOccurred())
+				output, err := Exec("vela up -f vela.json --wait --timeout=" + duration)
+				gomega.Expect(err).NotTo(gomega.HaveOccurred())
+				gomega.Expect(output).To(gomega.ContainSubstring("Timeout waiting Application to be healthy!"))
+			})
+		})
+	}
+
 	DeleteEnvFunc = func(context string, envName string) bool {
 		return ginkgo.Context(context, func() {
 			ginkgo.It("should print env does not exist message", func() {
@@ -133,10 +157,10 @@ var (
 	WorkloadDeleteContext = func(context string, applicationName string) bool {
 		return ginkgo.Context(context, func() {
 			ginkgo.It("should print successful deletion information", func() {
-				cli := fmt.Sprintf("vela delete %s", applicationName)
+				cli := fmt.Sprintf("vela delete %s -y", applicationName)
 				output, err := Exec(cli)
 				gomega.Expect(err).NotTo(gomega.HaveOccurred())
-				gomega.Expect(output).To(gomega.ContainSubstring("deleted from namespace"))
+				gomega.Expect(output).To(gomega.ContainSubstring("succeeded"))
 			})
 		})
 	}
@@ -181,6 +205,16 @@ var (
 		return ginkgo.Context(context, func() {
 			ginkgo.It("should show capability reference", func() {
 				cli := fmt.Sprintf("vela show %s", capabilityName)
+				_, err := Exec(cli)
+				gomega.Expect(err).Should(gomega.BeNil())
+			})
+		})
+	}
+
+	ShowCapabilityReferenceMarkdown = func(context string, capabilityName string) bool {
+		return ginkgo.Context(context, func() {
+			ginkgo.It("should show capability reference in markdown", func() {
+				cli := fmt.Sprintf("vela show %s --format=markdown", capabilityName)
 				_, err := Exec(cli)
 				gomega.Expect(err).Should(gomega.BeNil())
 			})

@@ -9,20 +9,18 @@ include makefiles/e2e.mk
 all: build
 
 # Run tests
-test: vet lint staticcheck unit-test-core test-cli-gen
+test: unit-test-core test-cli-gen
 	@$(OK) unit-tests pass
 
 test-cli-gen: 
 	mkdir -p ./bin/doc
-	go run ./hack/docgen/gen.go ./bin/doc
+	go run ./hack/docgen/cli/gen.go ./bin/doc
 unit-test-core:
 	go test -coverprofile=coverage.txt $(shell go list ./pkg/... ./cmd/... ./apis/... | grep -v apiserver | grep -v applicationconfiguration)
 	go test $(shell go list ./references/... | grep -v apiserver)
-unit-test-apiserver:
-	go test -gcflags=all=-l -coverprofile=coverage.txt $(shell go list ./pkg/... ./cmd/...  | grep -E 'apiserver|velaql')
 
 # Build vela cli binary
-build: fmt vet lint staticcheck vela-cli kubectl-vela
+build: vela-cli kubectl-vela
 	@$(OK) build succeed
 
 build-cleanup:
@@ -39,16 +37,23 @@ fmt: goimports installcue
 	$(CUE) fmt ./pkg/stdlib/op.cue
 	$(CUE) fmt ./pkg/workflow/tasks/template/static/*
 # Run go vet against code
+
+sdk_fmt:
+	./hack/sdk/reviewable.sh
+
 vet:
-	go vet ./...
+	@$(INFO) go vet
+	@go vet $(shell go list ./...|grep -v scaffold)
 
 staticcheck: staticchecktool
-	$(STATICCHECK) ./...
+	@$(INFO) staticcheck
+	@$(STATICCHECK) $(shell go list ./...|grep -v scaffold)
 
 lint: golangci
-	$(GOLANGCILINT) run ./...
+	@$(INFO) lint
+	@$(GOLANGCILINT) run --skip-dirs 'scaffold'
 
-reviewable: manifests fmt vet lint staticcheck helm-doc-gen
+reviewable: manifests fmt vet lint staticcheck helm-doc-gen sdk_fmt
 	go mod tidy
 
 # Execute auto-gen code commands and ensure branch is clean.
@@ -60,9 +65,6 @@ check-diff: reviewable
 # Push the docker image
 docker-push:
 	docker push $(VELA_CORE_IMAGE)
-
-build-swagger:
-	go run ./cmd/apiserver/main.go build-swagger ./docs/apidoc/swagger.json
 
 
 
@@ -82,28 +84,27 @@ endif
 
 
 
-# load docker image to the kind cluster
-kind-load: kind-load-runtime-cluster
+# load docker image to the k3d cluster
+image-load:
 	docker build -t $(VELA_CORE_TEST_IMAGE) -f Dockerfile.e2e .
-	kind load docker-image $(VELA_CORE_TEST_IMAGE) || { echo >&2 "kind not installed or error loading image: $(VELA_CORE_TEST_IMAGE)"; exit 1; }
+	k3d image import $(VELA_CORE_TEST_IMAGE) || { echo >&2 "kind not installed or error loading image: $(VELA_CORE_TEST_IMAGE)"; exit 1; }
 
-kind-load-runtime-cluster:
+image-load-runtime-cluster:
 	/bin/sh hack/e2e/build_runtime_rollout.sh
 	docker build -t $(VELA_RUNTIME_ROLLOUT_TEST_IMAGE) -f runtime/rollout/e2e/Dockerfile.e2e runtime/rollout/e2e/
 	rm -rf runtime/rollout/e2e/tmp
-	kind load docker-image $(VELA_RUNTIME_ROLLOUT_TEST_IMAGE)  || { echo >&2 "kind not installed or error loading image: $(VELA_RUNTIME_ROLLOUT_TEST_IMAGE)"; exit 1; }
-	kind load docker-image $(VELA_RUNTIME_ROLLOUT_TEST_IMAGE) --name=$(RUNTIME_CLUSTER_NAME)  || { echo >&2 "kind not installed or error loading image: $(VELA_RUNTIME_ROLLOUT_TEST_IMAGE)"; exit 1; }
+	k3d image import $(VELA_RUNTIME_ROLLOUT_TEST_IMAGE)  || { echo >&2 "kind not installed or error loading image: $(VELA_RUNTIME_ROLLOUT_TEST_IMAGE)"; exit 1; }
+	k3d cluster get $(RUNTIME_CLUSTER_NAME) && k3d image import $(VELA_RUNTIME_ROLLOUT_TEST_IMAGE) --cluster=$(RUNTIME_CLUSTER_NAME) || echo "no worker cluster"
 
 # Run tests
-core-test: fmt vet manifests
+core-test:
 	go test ./pkg/... -coverprofile cover.out
 
-# Build vela core manager and apiserver binary
-manager: fmt vet lint manifests
+# Build vela core manager binary
+manager:
 	$(GOBUILD_ENV) go build -o bin/manager -a -ldflags $(LDFLAGS) ./cmd/core/main.go
-	$(GOBUILD_ENV) go build -o bin/apiserver -a -ldflags $(LDFLAGS) ./cmd/apiserver/main.go
 
-vela-runtime-rollout-manager: fmt vet lint manifests
+vela-runtime-rollout-manager:
 	$(GOBUILD_ENV) go build -o ./runtime/rollout/bin/manager -a -ldflags $(LDFLAGS) ./runtime/rollout/cmd/main.go
 
 # Generate manifests e.g. CRD, RBAC etc.

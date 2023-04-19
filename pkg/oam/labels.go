@@ -27,6 +27,8 @@ const (
 	LabelAppDeployment = "app.oam.dev/appDeployment"
 	// LabelAppComponent records the name of Component
 	LabelAppComponent = "app.oam.dev/component"
+	// LabelReplicaKey records the replica key of Component
+	LabelReplicaKey = "app.oam.dev/replicaKey"
 	// LabelAppComponentRevision records the revision name of Component
 	LabelAppComponentRevision = "app.oam.dev/revision"
 	// LabelOAMResourceType whether a CR is workload or trait
@@ -69,6 +71,9 @@ const (
 	// LabelAddonName indicates the name of the corresponding Addon
 	LabelAddonName = "addons.oam.dev/name"
 
+	// LabelAddonAuxiliaryName indicates the name of the auxiliary resource in addon app template
+	LabelAddonAuxiliaryName = "addons.oam.dev/auxiliary-name"
+
 	// LabelAddonVersion indicates the version of the corresponding  installed Addon
 	LabelAddonVersion = "addons.oam.dev/version"
 
@@ -97,7 +102,17 @@ const (
 	// LabelProject recorde the project the resource belong to
 	LabelProject = "core.oam.dev/project"
 
+	// LabelResourceRules defines the configmap is representing the resource topology rules
 	LabelResourceRules = "rules.oam.dev/resources"
+
+	// LabelResourceRuleFormat defines the resource format of the resource topology rules
+	LabelResourceRuleFormat = "rules.oam.dev/resource-format"
+
+	// LabelControllerName indicates the controller name
+	LabelControllerName = "controller.oam.dev/name"
+
+	// LabelPreCheck indicates if the target resource is for pre-check test
+	LabelPreCheck = "core.oam.dev/pre-check"
 )
 
 const (
@@ -164,9 +179,6 @@ const (
 	// AnnotationDefinitionRevisionName is used to specify the name of DefinitionRevision in component/trait definition
 	AnnotationDefinitionRevisionName = "definitionrevision.oam.dev/name"
 
-	// AnnotationResourceTrackerLifeLong is used to identify life-long resourcetracker which should only be recycled when application is deleted
-	AnnotationResourceTrackerLifeLong = "resourcetracker.oam.dev/life-long"
-
 	// AnnotationAddonsName records the name of initializer stored in configMap
 	AnnotationAddonsName = "addons.oam.dev/name"
 
@@ -198,7 +210,7 @@ const (
 	// AnnotationWorkloadName indicates the managed workload's name by trait
 	AnnotationWorkloadName = "trait.oam.dev/workload-name"
 
-	// AnnotationControllerRequirement indicates the controller version that can process the application.
+	// AnnotationControllerRequirement indicates the controller version that can process the application/definition.
 	AnnotationControllerRequirement = "app.oam.dev/controller-version-require"
 
 	// AnnotationApplicationServiceAccountName indicates the name of the ServiceAccount to use to apply Components and run Workflow.
@@ -210,4 +222,35 @@ const (
 
 	// AnnotationApplicationGroup indicates the group of the Application to use to apply resources
 	AnnotationApplicationGroup = "app.oam.dev/group"
+
+	// AnnotationAppSharedBy records who share the application
+	AnnotationAppSharedBy = "app.oam.dev/shared-by"
+
+	// AnnotationResourceURL records the source url of the Kubernetes object
+	AnnotationResourceURL = "app.oam.dev/resource-url"
+
+	// AnnotationIgnoreWithoutCompKey indicates the bond component.
+	// Deprecated: please use AnnotationAddonDefinitionBindCompKey.
+	AnnotationIgnoreWithoutCompKey = "addon.oam.dev/ignore-without-component"
+
+	// AnnotationAddonDefinitionBondCompKey indicates the definition in addon bond component.
+	AnnotationAddonDefinitionBondCompKey = "addon.oam.dev/bind-component"
+
+	// AnnotationSkipResume annotation indicates that the resource does not need to be resumed.
+	AnnotationSkipResume = "controller.core.oam.dev/skip-resume"
+)
+
+const (
+	// ResourceTopologyFormatYAML mark the format of resource topology is yaml, by default, it's yaml.
+	ResourceTopologyFormatYAML = "yaml"
+	// ResourceTopologyFormatJSON mark the format of resource topology is json.
+	ResourceTopologyFormatJSON = "json"
+)
+
+const (
+	// FinalizerResourceTracker is the application finalizer for gc
+	FinalizerResourceTracker = "app.oam.dev/resource-tracker-finalizer"
+	// FinalizerOrphanResource indicates that the gc process should orphan managed
+	// resources instead of deleting them
+	FinalizerOrphanResource = "app.oam.dev/orphan-resource"
 )

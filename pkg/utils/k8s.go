@@ -20,19 +20,37 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"os"
+	"regexp"
+	"strings"
+	"text/template"
+	"time"
 
+	"github.com/tidwall/gjson"
+	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/runtime"
+
+	"github.com/fatih/color"
+	"github.com/kubevela/pkg/multicluster"
+	"github.com/pkg/errors"
+	"github.com/wercker/stern/stern"
 	authv1 "k8s.io/api/authentication/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/selection"
 	k8stypes "k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	"github.com/oam-dev/kubevela/pkg/oam/util"
 	velaerr "github.com/oam-dev/kubevela/pkg/utils/errors"
+	querytypes "github.com/oam-dev/kubevela/pkg/velaql/providers/query/types"
 )
 
 // MutateOption defines the function pattern for mutate
@@ -74,11 +92,26 @@ func MergeNoConflictLabels(labels map[string]string) MutateOption {
 // CreateOrUpdateNamespace will create a namespace if not exist, it will also update a namespace if exists
 // It will report an error if the labels conflict while it will override the annotations
 func CreateOrUpdateNamespace(ctx context.Context, kubeClient client.Client, name string, options ...MutateOption) error {
-	err := CreateNamespace(ctx, kubeClient, name, options...)
-	if err != nil && !apierrors.IsAlreadyExists(err) {
+	ns, err := GetNamespace(ctx, kubeClient, name)
+	switch {
+	case err == nil:
+		return PatchNamespace(ctx, kubeClient, ns, options...)
+	case apierrors.IsNotFound(err):
+		return CreateNamespace(ctx, kubeClient, name, options...)
+	default:
 		return err
 	}
-	return UpdateNamespace(ctx, kubeClient, name, options...)
+}
+
+// PatchNamespace will patch a namespace
+func PatchNamespace(ctx context.Context, kubeClient client.Client, ns *corev1.Namespace, options ...MutateOption) error {
+	original := ns.DeepCopy()
+	for _, op := range options {
+		if err := op(ns); err != nil {
+			return err
+		}
+	}
+	return kubeClient.Patch(ctx, ns, client.MergeFrom(original))
 }
 
 // CreateNamespace will create a namespace with mutate option
@@ -132,7 +165,7 @@ func GetServiceAccountSubjectFromConfig(cfg *rest.Config) string {
 func GetCertificateCommonNameAndOrganizationsFromConfig(cfg *rest.Config) (string, []string) {
 	cert := cfg.CertData
 	if len(cert) == 0 && cfg.CertFile != "" {
-		cert, _ = ioutil.ReadFile(cfg.CertFile)
+		cert, _ = os.ReadFile(cfg.CertFile)
 	}
 	name, _ := GetCertificateSubject(cert)
 	if name == nil {
@@ -182,4 +215,201 @@ func CreateOrUpdate(ctx context.Context, cli client.Client, obj client.Object) (
 		obj.SetManagedFields(managedFields)
 		return nil
 	})
+}
+
+// EscapeResourceNameToLabelValue parse characters in resource name to label valid name
+func EscapeResourceNameToLabelValue(resourceName string) string {
+	return strings.ReplaceAll(resourceName, ":", "_")
+}
+
+// IsClusterScope check if the gvk is cluster scoped
+func IsClusterScope(gvk schema.GroupVersionKind, mapper meta.RESTMapper) (bool, error) {
+	mappings, err := mapper.RESTMappings(gvk.GroupKind(), gvk.Version)
+	isClusterScope := len(mappings) > 0 && mappings[0].Scope.Name() == meta.RESTScopeNameRoot
+	return isClusterScope, err
+}
+
+// GetPodsLogs get logs from pods
+func GetPodsLogs(ctx context.Context, config *rest.Config, containerName string, selectPods []*querytypes.PodBase, tmpl string, logC chan<- string, tailLines *int64) error {
+	if err := verifyPods(selectPods); err != nil {
+		return err
+	}
+	podRegex := getPodRegex(selectPods)
+	pods, err := regexp.Compile(podRegex)
+	if err != nil {
+		return fmt.Errorf("fail to compile '%s' for logs query", podRegex)
+	}
+	container := regexp.MustCompile(".*")
+	if containerName != "" {
+		container = regexp.MustCompile(containerName + ".*")
+	}
+	// These pods are from the same namespace, so we can use the first one to get the namespace
+	namespace := selectPods[0].Metadata.Namespace
+	selector := labels.NewSelector()
+	// Only use the labels to select pod if query one pod's log. It is only used when query vela-core log
+	if len(selectPods) == 1 {
+		for k, v := range selectPods[0].Metadata.Labels {
+			req, _ := labels.NewRequirement(k, selection.Equals, []string{v})
+			if req != nil {
+				selector = selector.Add(*req)
+			}
+		}
+	}
+	config.Wrap(multicluster.NewTransportWrapper())
+	clientSet, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		return err
+	}
+	added, removed, err := stern.Watch(ctx,
+		clientSet.CoreV1().Pods(namespace),
+		pods,
+		container,
+		nil,
+		[]stern.ContainerState{stern.RUNNING, stern.TERMINATED},
+		selector,
+	)
+	if err != nil {
+		return err
+	}
+	tails := make(map[string]*stern.Tail)
+
+	funs := map[string]interface{}{
+		"json": func(in interface{}) (string, error) {
+			b, err := json.Marshal(in)
+			if err != nil {
+				return "", err
+			}
+			return string(b), nil
+		},
+		"color": func(color color.Color, text string) string {
+			return color.SprintFunc()(text)
+		},
+	}
+	template, err := template.New("log").Funcs(funs).Parse(tmpl)
+	if err != nil {
+		return errors.Wrap(err, "unable to parse template")
+	}
+
+	go func() {
+		for p := range added {
+			id := p.GetID()
+			if tails[id] != nil {
+				continue
+			}
+			// 48h
+			dur, _ := time.ParseDuration("48h")
+			tail := stern.NewTail(p.Namespace, p.Pod, p.Container, template, &stern.TailOptions{
+				Timestamps:   true,
+				SinceSeconds: int64(dur.Seconds()),
+				Exclude:      nil,
+				Include:      nil,
+				Namespace:    false,
+				TailLines:    tailLines, // default for all logs
+			})
+			tails[id] = tail
+
+			tail.Start(ctx, clientSet.CoreV1().Pods(p.Namespace), logC)
+		}
+	}()
+
+	go func() {
+		for p := range removed {
+			id := p.GetID()
+			if tails[id] == nil {
+				continue
+			}
+			tails[id].Close()
+			delete(tails, id)
+		}
+	}()
+
+	<-ctx.Done()
+	close(logC)
+	return nil
+}
+
+func getPodRegex(pods []*querytypes.PodBase) string {
+	var podNames []string
+	for _, pod := range pods {
+		podNames = append(podNames, fmt.Sprintf("(%s.*)", pod.Metadata.Name))
+	}
+	return strings.Join(podNames, "|")
+}
+
+func verifyPods(pods []*querytypes.PodBase) error {
+	if len(pods) == 0 {
+		return errors.New("no pods selected")
+	}
+	if len(pods) == 1 {
+		return nil
+	}
+	namespace := pods[0].Metadata.Namespace
+	for _, pod := range pods {
+		if pod.Metadata.Namespace != namespace {
+			return errors.New("cannot select pods from different namespaces")
+		}
+	}
+	return nil
+}
+
+// FilterObjectsByFieldSelector supports all field queries per type
+func FilterObjectsByFieldSelector(objects []runtime.Object, fieldSelector fields.Selector) []runtime.Object {
+	filterFunc := createFieldFilter(fieldSelector)
+	// selected matched ones
+	var filtered []runtime.Object
+	for _, object := range objects {
+		selected := true
+		if !filterFunc(object) {
+			selected = false
+		}
+
+		if selected {
+			filtered = append(filtered, object)
+		}
+	}
+	return filtered
+}
+
+// FilterFunc return true if object contains field selector
+type FilterFunc func(object runtime.Object) bool
+
+// createFieldFilter return filterFunc
+func createFieldFilter(selector fields.Selector) FilterFunc {
+	return func(object runtime.Object) bool {
+		return contains(&object, selector)
+	}
+}
+
+// implement a generic query filter to support multiple field selectors
+func contains(object *runtime.Object, fieldSelector fields.Selector) bool {
+	// call the ParseSelector function of "k8s.io/apimachinery/pkg/fields/selector.go" to validate and parse the selector
+	for _, requirement := range fieldSelector.Requirements() {
+		var negative bool
+		// supports '=', '==' and '!='.(e.g. ?fieldSelector=key1=value1,key2=value2)
+		// fields.ParseSelector(FieldSelector) has handled the case where the operator is '==' and converted it to '=',
+		// so case selection.DoubleEquals can be ignored here.
+		switch requirement.Operator {
+		case selection.NotEquals:
+			negative = true
+		case selection.Equals:
+			negative = false
+		default:
+			return false
+		}
+		key := requirement.Field
+		value := requirement.Value
+
+		data, err := json.Marshal(object)
+		if err != nil {
+			return false
+		}
+		result := gjson.Get(string(data), key)
+		if (negative && fmt.Sprintf("%v", result.String()) != value) ||
+			(!negative && fmt.Sprintf("%v", result.String()) == value) {
+			continue
+		} else {
+			return false
+		}
+	}
+	return true
 }

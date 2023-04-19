@@ -22,10 +22,13 @@ import (
 	"fmt"
 	"reflect"
 	"strconv"
+	"testing"
 	"time"
 
+	workflowv1alpha1 "github.com/kubevela/workflow/api/v1alpha1"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
+	"github.com/stretchr/testify/require"
 
 	"github.com/google/go-cmp/cmp"
 	appsv1 "k8s.io/api/apps/v1"
@@ -43,7 +46,7 @@ import (
 	"github.com/oam-dev/kubevela/apis/standard.oam.dev/v1alpha1"
 	oamtypes "github.com/oam-dev/kubevela/apis/types"
 	"github.com/oam-dev/kubevela/pkg/appfile"
-	"github.com/oam-dev/kubevela/pkg/cue/model"
+	"github.com/oam-dev/kubevela/pkg/cue/process"
 	"github.com/oam-dev/kubevela/pkg/oam"
 	"github.com/oam-dev/kubevela/pkg/oam/util"
 )
@@ -54,7 +57,6 @@ var _ = Describe("test generate revision ", func() {
 	cd := v1beta1.ComponentDefinition{}
 	webCompDef := v1beta1.ComponentDefinition{}
 	wd := v1beta1.WorkloadDefinition{}
-	td := v1beta1.TraitDefinition{}
 	sd := v1beta1.ScopeDefinition{}
 	rolloutTd := v1beta1.TraitDefinition{}
 	var handler *AppHandler
@@ -75,11 +77,6 @@ var _ = Describe("test generate revision ", func() {
 		Expect(json.Unmarshal(componentDefJson, &cd)).Should(BeNil())
 		cd.ResourceVersion = ""
 		Expect(k8sClient.Create(ctx, &cd)).Should(SatisfyAny(BeNil(), &util.AlreadyExistMatcher{}))
-
-		traitDefJson, _ := yaml.YAMLToJSON([]byte(traitDefYaml))
-		Expect(json.Unmarshal(traitDefJson, &td)).Should(BeNil())
-		td.ResourceVersion = ""
-		Expect(k8sClient.Create(ctx, &td)).Should(SatisfyAny(BeNil(), &util.AlreadyExistMatcher{}))
 
 		scopeDefJson, _ := yaml.YAMLToJSON([]byte(scopeDefYaml))
 		Expect(json.Unmarshal(scopeDefJson, &sd)).Should(BeNil())
@@ -123,14 +120,6 @@ var _ = Describe("test generate revision ", func() {
 						Properties: &runtime.RawExtension{
 							Raw: []byte(`{"image": "oamdev/testapp:v1", "cmd": ["node", "server.js"]}`),
 						},
-						Traits: []common.ApplicationTrait{
-							{
-								Type: td.Name,
-								Properties: &runtime.RawExtension{
-									Raw: []byte(`{"replicas": 5}`),
-								},
-							},
-						},
 					},
 				},
 			},
@@ -143,16 +132,18 @@ var _ = Describe("test generate revision ", func() {
 				Name: "appRevision1",
 			},
 			Spec: v1beta1.ApplicationRevisionSpec{
-				ComponentDefinitions: make(map[string]v1beta1.ComponentDefinition),
-				WorkloadDefinitions:  make(map[string]v1beta1.WorkloadDefinition),
-				TraitDefinitions:     make(map[string]v1beta1.TraitDefinition),
-				ScopeDefinitions:     make(map[string]v1beta1.ScopeDefinition),
+				ApplicationRevisionCompressibleFields: v1beta1.ApplicationRevisionCompressibleFields{
+					ComponentDefinitions: make(map[string]*v1beta1.ComponentDefinition),
+					WorkloadDefinitions:  make(map[string]v1beta1.WorkloadDefinition),
+					TraitDefinitions:     make(map[string]*v1beta1.TraitDefinition),
+					ScopeDefinitions:     make(map[string]v1beta1.ScopeDefinition),
+				},
 			},
 		}
 		appRevision1.Spec.Application = app
-		appRevision1.Spec.ComponentDefinitions[cd.Name] = cd
+		appRevision1.Spec.ComponentDefinitions[cd.Name] = cd.DeepCopy()
 		appRevision1.Spec.WorkloadDefinitions[wd.Name] = wd
-		appRevision1.Spec.TraitDefinitions[td.Name] = td
+		appRevision1.Spec.TraitDefinitions[rolloutTd.Name] = rolloutTd.DeepCopy()
 		appRevision1.Spec.ScopeDefinitions[sd.Name] = sd
 
 		appRevision2 = *appRevision1.DeepCopy()
@@ -167,10 +158,6 @@ var _ = Describe("test generate revision ", func() {
 		By("[TEST] Clean up resources after an integration test")
 		Expect(k8sClient.Delete(context.TODO(), &ns)).Should(Succeed())
 	})
-
-	verifyDeepEqualRevision := func() {
-		Expect(DeepEqualRevision(&appRevision1, &appRevision2)).Should(BeTrue())
-	}
 
 	verifyEqual := func() {
 		appHash1, err := ComputeAppRevisionHash(&appRevision1)
@@ -199,22 +186,9 @@ var _ = Describe("test generate revision ", func() {
 		// add an annotation to workload Definition
 		wd.SetAnnotations(map[string]string{oam.AnnotationAppRollout: "true"})
 		appRevision2.Spec.WorkloadDefinitions[wd.Name] = wd
-		// add status to td
-		td.SetConditions(v1alpha1.NewPositiveCondition("Test"))
-		appRevision2.Spec.TraitDefinitions[td.Name] = td
-		// change the cd meta
-		cd.ClusterName = "testCluster"
-		appRevision2.Spec.ComponentDefinitions[cd.Name] = cd
+		appRevision2.Spec.ComponentDefinitions[cd.Name] = cd.DeepCopy()
 
 		verifyEqual()
-	})
-
-	It("Test app revisions with different trait spec should produce different hash and not equal", func() {
-		// change td spec
-		td.Spec.AppliesToWorkloads = append(td.Spec.AppliesToWorkloads, "allWorkload")
-		appRevision2.Spec.TraitDefinitions[td.Name] = td
-
-		verifyNotEqual()
 	})
 
 	It("Test app revisions with different application spec should produce different hash and not equal", func() {
@@ -227,23 +201,9 @@ var _ = Describe("test generate revision ", func() {
 
 	It("Test app revisions with different application spec should produce different hash and not equal", func() {
 		// add a component definition
-		appRevision1.Spec.ComponentDefinitions[webCompDef.Name] = webCompDef
+		appRevision1.Spec.ComponentDefinitions[webCompDef.Name] = webCompDef.DeepCopy()
 
 		verifyNotEqual()
-	})
-
-	It("Test appliction contain a SkipAppRevision tait will have same hash and revision will equal", func() {
-		rolloutTrait := common.ApplicationTrait{
-			Type: "rollout",
-			Properties: &runtime.RawExtension{
-				Raw: []byte(`{"targetRevision":"myrev-v1"}`),
-			},
-		}
-		appRevision2.Spec.Application.Spec.Components[0].Traits = append(appRevision2.Spec.Application.Spec.Components[0].Traits, rolloutTrait)
-		// appRevision will have no traitDefinition of rollout
-		appRevision2.Spec.TraitDefinitions[rolloutTd.Name] = rolloutTd
-		verifyEqual()
-		verifyDeepEqualRevision()
 	})
 
 	It("Test application revision compare", func() {
@@ -753,7 +713,7 @@ var _ = Describe("Test ReplaceComponentRevisionContext func", func() {
 				Kind:       "Rollout",
 			},
 			Spec: v1alpha1.RolloutSpec{
-				TargetRevisionName: model.ComponentRevisionPlaceHolder,
+				TargetRevisionName: process.ComponentRevisionPlaceHolder,
 			},
 		}
 		u, err := util.Object2Unstructured(rollout)
@@ -774,7 +734,7 @@ var _ = Describe("Test ReplaceComponentRevisionContext func", func() {
 				Kind:       "Rollout",
 			},
 			Spec: v1alpha1.RolloutSpec{
-				TargetRevisionName: model.ComponentRevisionPlaceHolder,
+				TargetRevisionName: process.ComponentRevisionPlaceHolder,
 			},
 		}
 		u, err := util.Object2Unstructured(rollout)
@@ -782,49 +742,6 @@ var _ = Describe("Test ReplaceComponentRevisionContext func", func() {
 		By("test replace with a bad revision")
 		err = replaceComponentRevisionContext(u, "comp-rev1-\\}")
 		Expect(err).ShouldNot(BeNil())
-	})
-})
-
-var _ = Describe("Test remove SkipAppRev func", func() {
-	It("Test remove spec", func() {
-		appSpec := v1beta1.ApplicationSpec{
-			Components: []common.ApplicationComponent{
-				{
-					Traits: []common.ApplicationTrait{
-						{
-							Type: "rollout",
-						},
-						{
-							Type: "ingress",
-						},
-						{
-							Type: "service",
-						},
-					},
-				},
-			},
-		}
-		tds := map[string]v1beta1.TraitDefinition{
-			"rollout": {
-				Spec: v1beta1.TraitDefinitionSpec{
-					SkipRevisionAffect: true,
-				},
-			},
-			"ingress": {
-				Spec: v1beta1.TraitDefinitionSpec{
-					SkipRevisionAffect: false,
-				},
-			},
-			"service": {
-				Spec: v1beta1.TraitDefinitionSpec{
-					SkipRevisionAffect: false,
-				},
-			},
-		}
-		res := filterSkipAffectAppRevTrait(appSpec, tds)
-		Expect(len(res.Components[0].Traits)).Should(BeEquivalentTo(2))
-		Expect(res.Components[0].Traits[0].Type).Should(BeEquivalentTo("ingress"))
-		Expect(res.Components[0].Traits[1].Type).Should(BeEquivalentTo("service"))
 	})
 })
 
@@ -1161,7 +1078,7 @@ status: {}
 		Expect(len(thisWSD) > 0 && func() bool {
 			expected := appfile.RelatedWorkflowStepDefinitions
 			for i, w := range thisWSD {
-				expW := *(expected[i])
+				expW := expected[i]
 				if !reflect.DeepEqual(w, expW) {
 					fmt.Printf("appfile wsd:%s apprev wsd%s", w.Name, expW.Name)
 					return false
@@ -1171,3 +1088,21 @@ status: {}
 		}()).Should(BeTrue())
 	})
 })
+
+func TestDeepEqualAppInRevision(t *testing.T) {
+	oldRev := &v1beta1.ApplicationRevision{}
+	newRev := &v1beta1.ApplicationRevision{}
+	newRev.Spec.Application.Spec.Workflow = &v1beta1.Workflow{
+		Steps: []workflowv1alpha1.WorkflowStep{{
+			WorkflowStepBase: workflowv1alpha1.WorkflowStepBase{
+				Type: "deploy",
+				Name: "deploy",
+			},
+		}},
+	}
+	require.False(t, deepEqualAppInRevision(oldRev, newRev))
+	metav1.SetMetaDataAnnotation(&oldRev.Spec.Application.ObjectMeta, oam.AnnotationKubeVelaVersion, "v1.6.0-alpha.5")
+	require.False(t, deepEqualAppInRevision(oldRev, newRev))
+	metav1.SetMetaDataAnnotation(&oldRev.Spec.Application.ObjectMeta, oam.AnnotationKubeVelaVersion, "v1.5.0")
+	require.True(t, deepEqualAppInRevision(oldRev, newRev))
+}

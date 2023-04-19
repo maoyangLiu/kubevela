@@ -38,9 +38,14 @@ const (
 	addonGitToken     = "gitToken"
 	addonOssType      = "OSS"
 	addonGitType      = "git"
+	addonGiteeType    = "gitee"
+	addonGitlabType   = "gitlab"
 	addonHelmType     = "helm"
 	addonUsername     = "username"
 	addonPassword     = "password"
+	// only gitlab registry need set this flag
+	addonRepoName            = "gitlabRepoName"
+	addonHelmInsecureSkipTLS = "insecureSkipTLS"
 )
 
 // NewAddonRegistryCommand return an addon registry command
@@ -63,14 +68,27 @@ func NewAddonRegistryCommand(c common.Args, ioStreams cmdutil.IOStreams) *cobra.
 // NewAddAddonRegistryCommand return an addon registry create command
 func NewAddAddonRegistryCommand(c common.Args, ioStreams cmdutil.IOStreams) *cobra.Command {
 	cmd := &cobra.Command{
-		Use:     "add",
-		Short:   "Add an addon registry.",
-		Long:    "Add an addon registry.",
-		Example: `"vela addon registry add <my-registry-name> --type OSS --endpoint=<URL> --bucket=<bukect-name> or vela addon registry add my-repo --type git --endpoint=<URL> --path=<OSS-ptah> --gitToken=<git token>"`,
+		Use:   "add",
+		Short: "Add an addon registry.",
+		Long:  "Add an addon registry.",
+		Example: `add a helm repo registry: vela addon registry add --type=helm my-repo --endpoint=<URL>
+add a github registry: vela addon registry add my-repo --type git --endpoint=<URL> --path=<ptah> --gitToken=<git token>" 
+add a gitlab registry: vela addon registry add my-repo --type gitlab --endpoint=<URL> --gitlabRepoName=<repoName> --path=<path> --gitToken=<git token>`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			registry, err := getRegistryFromArgs(cmd, args)
 			if err != nil {
 				return err
+			}
+			if registry.Helm != nil {
+				versionedRegistry := pkgaddon.BuildVersionedRegistry(registry.Name, registry.Helm.URL, &common.HTTPOption{
+					Username:        registry.Helm.Username,
+					Password:        registry.Helm.Password,
+					InsecureSkipTLS: registry.Helm.InsecureSkipTLS,
+				})
+				_, err = versionedRegistry.ListAddon()
+				if err != nil {
+					return fmt.Errorf("fail to add registry %s: %w", registry.Name, err)
+				}
 			}
 			if err := addAddonRegistry(context.Background(), c, *registry); err != nil {
 				return err
@@ -294,6 +312,9 @@ func parseArgsFromFlag(cmd *cobra.Command) {
 	cmd.Flags().StringP(addonGitToken, "", "", "specify the github repo token")
 	cmd.Flags().StringP(addonUsername, "", "", "specify the Helm addon registry username")
 	cmd.Flags().StringP(addonPassword, "", "", "specify the Helm addon registry password")
+	cmd.Flags().StringP(addonRepoName, "", "", "specify the gitlab addon registry repoName")
+	cmd.Flags().BoolP(addonHelmInsecureSkipTLS, "", false,
+		"specify the Helm addon registry skip tls verify")
 }
 
 func getRegistryFromArgs(cmd *cobra.Command, args []string) (*pkgaddon.Registry, error) {
@@ -344,6 +365,37 @@ func getRegistryFromArgs(cmd *cobra.Command, args []string) (*pkgaddon.Registry,
 			return nil, err
 		}
 		r.Git.Token = token
+	case addonGiteeType:
+		r.Gitee = &pkgaddon.GiteeAddonSource{}
+		r.Gitee.URL = endpoint
+		path, err := cmd.Flags().GetString(addonPath)
+		if err != nil {
+			return nil, err
+		}
+		r.Gitee.Path = path
+		token, err := cmd.Flags().GetString(addonGitToken)
+		if err != nil {
+			return nil, err
+		}
+		r.Gitee.Token = token
+	case addonGitlabType:
+		r.Gitlab = &pkgaddon.GitlabAddonSource{}
+		r.Gitlab.URL = endpoint
+		path, err := cmd.Flags().GetString(addonPath)
+		if err != nil {
+			return nil, err
+		}
+		r.Gitlab.Path = path
+		token, err := cmd.Flags().GetString(addonGitToken)
+		if err != nil {
+			return nil, err
+		}
+		r.Gitlab.Token = token
+		gitLabRepoName, err := cmd.Flags().GetString(addonRepoName)
+		if err != nil {
+			return nil, err
+		}
+		r.Gitlab.Repo = gitLabRepoName
 	case addonHelmType:
 		r.Helm = &pkgaddon.HelmSource{}
 		r.Helm.URL = endpoint
@@ -352,6 +404,10 @@ func getRegistryFromArgs(cmd *cobra.Command, args []string) (*pkgaddon.Registry,
 			return nil, err
 		}
 		r.Helm.Password, err = cmd.Flags().GetString(addonPassword)
+		if err != nil {
+			return nil, err
+		}
+		r.Helm.InsecureSkipTLS, err = cmd.Flags().GetBool(addonHelmInsecureSkipTLS)
 		if err != nil {
 			return nil, err
 		}

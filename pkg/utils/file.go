@@ -19,11 +19,14 @@ package utils
 import (
 	"context"
 	"fmt"
+	"io"
 	"io/fs"
-	"io/ioutil"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/pkg/errors"
 
 	"github.com/oam-dev/kubevela/pkg/utils/common"
 )
@@ -39,6 +42,14 @@ type FileData struct {
 // If path is a file, fetch the data from the file
 // If path is a dir, fetch the data from all the files inside the dir that passes the pathFilter
 func LoadDataFromPath(ctx context.Context, path string, pathFilter func(string) bool) ([]FileData, error) {
+	if path == "-" {
+		bs, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get data from stdin: %w", err)
+		}
+		return []FileData{{Path: path, Data: bs}}, nil
+	}
+
 	if IsValidURL(path) {
 		bs, err := common.HTTPGetWithOption(ctx, path, nil)
 		if err != nil {
@@ -54,7 +65,7 @@ func LoadDataFromPath(ctx context.Context, path string, pathFilter func(string) 
 		var data []FileData
 		err = filepath.WalkDir(path, func(path string, d fs.DirEntry, err error) error {
 			if pathFilter == nil || pathFilter(path) {
-				bs, e := ioutil.ReadFile(filepath.Clean(path))
+				bs, e := os.ReadFile(filepath.Clean(path))
 				if e != nil {
 					return e
 				}
@@ -67,16 +78,61 @@ func LoadDataFromPath(ctx context.Context, path string, pathFilter func(string) 
 		}
 		return data, nil
 	}
-	bs, e := ioutil.ReadFile(filepath.Clean(path))
+	bs, e := os.ReadFile(filepath.Clean(path))
 	if e != nil {
 		return nil, fmt.Errorf("failed to read file %s: %w", path, err)
 	}
 	return []FileData{{Path: path, Data: bs}}, nil
 }
 
-// IsJSONOrYAMLFile check if the path is a json or yaml file
-func IsJSONOrYAMLFile(path string) bool {
+// IsJSONYAMLorCUEFile check if the path is a json or yaml file
+func IsJSONYAMLorCUEFile(path string) bool {
 	return strings.HasSuffix(path, ".json") ||
 		strings.HasSuffix(path, ".yaml") ||
-		strings.HasSuffix(path, ".yml")
+		strings.HasSuffix(path, ".yml") ||
+		strings.HasSuffix(path, ".cue")
+}
+
+// IsCUEFile check if the path is a cue file
+func IsCUEFile(path string) bool {
+	return strings.HasSuffix(path, ".cue")
+}
+
+// IsEmptyDir checks if a given path is an empty directory
+func IsEmptyDir(path string) (bool, error) {
+	f, err := os.Open(filepath.Clean(path))
+	if err != nil {
+		return false, err
+	}
+	defer func(f *os.File) {
+		_ = f.Close()
+	}(f)
+
+	// Read just one file in the dir (just read names, which is faster)
+	_, err = f.Readdirnames(1)
+	// If the error is EOF, the dir is empty
+	if errors.Is(err, io.EOF) {
+		return true, nil
+	}
+
+	return false, err
+}
+
+// GetFilenameFromLocalOrRemote returns the filename of a local path or a URL.
+// It doesn't guarantee that the file or URL actually exists.
+func GetFilenameFromLocalOrRemote(path string) (string, error) {
+	if !IsValidURL(path) {
+		abs, err := filepath.Abs(path)
+		if err != nil {
+			return "", err
+		}
+		return strings.TrimSuffix(filepath.Base(abs), filepath.Ext(abs)), nil
+	}
+
+	u, err := url.Parse(path)
+	if err != nil {
+		return "", err
+	}
+
+	return strings.TrimSuffix(filepath.Base(u.Path), filepath.Ext(u.Path)), nil
 }

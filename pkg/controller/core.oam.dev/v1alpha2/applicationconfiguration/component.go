@@ -38,6 +38,7 @@ import (
 	"github.com/oam-dev/kubevela/apis/core.oam.dev/v1alpha2"
 	"github.com/oam-dev/kubevela/pkg/controller/utils"
 	"github.com/oam-dev/kubevela/pkg/oam"
+	pkgutil "github.com/oam-dev/kubevela/pkg/utils"
 )
 
 // ControllerRevisionComponentLabel indicate which component the revision belong to
@@ -185,11 +186,11 @@ func (c *ComponentHandler) createControllerRevision(mt metav1.Object, obj client
 					Kind:       v1alpha2.ComponentKind,
 					Name:       comp.Name,
 					UID:        comp.UID,
-					Controller: pointer.BoolPtr(true),
+					Controller: pointer.Bool(true),
 				},
 			},
 			Labels: map[string]string{
-				ControllerRevisionComponentLabel: comp.Name,
+				ControllerRevisionComponentLabel: pkgutil.EscapeResourceNameToLabelValue(comp.Name),
 			},
 		},
 		Revision: nextRevision,
@@ -250,7 +251,7 @@ func sortedControllerRevision(appConfigs []v1alpha2.ApplicationConfiguration, re
 func (c *ComponentHandler) cleanupControllerRevision(curComp *v1alpha2.Component) error {
 	labels := &metav1.LabelSelector{
 		MatchLabels: map[string]string{
-			ControllerRevisionComponentLabel: curComp.Name,
+			ControllerRevisionComponentLabel: pkgutil.EscapeResourceNameToLabelValue(curComp.Name),
 		},
 	}
 	selector, err := metav1.LabelSelectorAsSelector(labels)
@@ -292,7 +293,7 @@ func (c *ComponentHandler) cleanupControllerRevision(curComp *v1alpha2.Component
 }
 
 // UpdateStatus updates v1alpha2.Component's Status with retry.RetryOnConflict
-func (c *ComponentHandler) UpdateStatus(ctx context.Context, comp *v1alpha2.Component, opts ...client.UpdateOption) error {
+func (c *ComponentHandler) UpdateStatus(ctx context.Context, comp *v1alpha2.Component, opts ...client.SubResourceUpdateOption) error {
 	status := comp.DeepCopy().Status
 	return retry.RetryOnConflict(retry.DefaultBackoff, func() (err error) {
 		if err = c.Client.Get(ctx, types.NamespacedName{Namespace: comp.Namespace, Name: comp.Name}, comp); err != nil {

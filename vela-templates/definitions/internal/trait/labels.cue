@@ -1,10 +1,7 @@
 labels: {
 	type: "trait"
 	annotations: {}
-	labels: {
-		"ui-hidden": "true"
-	}
-	description: "Add labels on K8s pod for your workload which follows the pod spec in path 'spec.template'."
+	description: "Add labels on your workload. if it generates pod, add same label for generated pods."
 	attributes: {
 		podDisruptive: true
 		appliesToWorkloads: ["*"]
@@ -16,14 +13,14 @@ template: {
 		metadata: {
 			labels: {
 				for k, v in parameter {
-					"\(k)": v
+					(k): v
 				}
 			}
 		}
 		if context.output.spec != _|_ && context.output.spec.template != _|_ {
 			spec: template: metadata: labels: {
 				for k, v in parameter {
-					"\(k)": v
+					(k): v
 				}
 			}
 		}

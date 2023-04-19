@@ -5,13 +5,14 @@ kind: TraitDefinition
 metadata:
   annotations:
     definition.oam.dev/description: Set the image of the container.
-  labels:
-    custom.definition.oam.dev/ui-hidden: "true"
   name: container-image
   namespace: {{ include "systemDefinitionNamespace" . }}
 spec:
   appliesToWorkloads:
-    - '*'
+    - deployments.apps
+    - statefulsets.apps
+    - daemonsets.apps
+    - jobs.batch
   podDisruptive: true
   schematic:
     cue:
@@ -71,9 +72,11 @@ spec:
         		}]
         	}
         }
-        parameter: *#PatchParams | close({
+
+        parameter: #PatchParams | close({
         	// +usage=Specify the container image for multiple containers
         	containers: [...#PatchParams]
         })
+
         errs: [ for c in patch.spec.template.spec.containers if c.err != _|_ {c.err}]
 

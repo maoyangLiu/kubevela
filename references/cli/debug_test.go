@@ -49,8 +49,10 @@ func TestDebugApplicationWithWorkflow(t *testing.T) {
 					Name:      "no-debug-config-map",
 					Namespace: "default",
 				},
-				Spec:   workflowSpec,
-				Status: common.AppStatus{},
+				Spec: workflowSpec,
+				Status: common.AppStatus{
+					Workflow: &common.WorkflowStatus{},
+				},
 			},
 			step:        "test-wf1",
 			focus:       "test",
@@ -61,13 +63,16 @@ func TestDebugApplicationWithWorkflow(t *testing.T) {
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "config-map-no-data",
 					Namespace: "default",
+					UID:       "12345",
 				},
-				Spec:   workflowSpec,
-				Status: common.AppStatus{},
+				Spec: workflowSpec,
+				Status: common.AppStatus{
+					Workflow: &common.WorkflowStatus{},
+				},
 			},
 			cm: &corev1.ConfigMap{
 				ObjectMeta: metav1.ObjectMeta{
-					Name:      "config-map-no-data-test-wf1-debug",
+					Name:      "config-map-no-data-test-wf1-debug-12345",
 					Namespace: "default",
 				},
 			},
@@ -80,35 +85,39 @@ func TestDebugApplicationWithWorkflow(t *testing.T) {
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "config-map-error-data",
 					Namespace: "default",
+					UID:       "12345",
 				},
-				Spec:   workflowSpec,
-				Status: common.AppStatus{},
+				Spec: workflowSpec,
+				Status: common.AppStatus{
+					Workflow: &common.WorkflowStatus{},
+				},
 			},
 			cm: &corev1.ConfigMap{
 				ObjectMeta: metav1.ObjectMeta{
-					Name:      "config-map-error-data-test-wf1-debug",
+					Name:      "config-map-error-data-test-wf1-debug-12345",
 					Namespace: "default",
 				},
 				Data: map[string]string{
 					"debug": "error",
 				},
 			},
-			step:        "test-wf1",
-			focus:       "test",
-			expectedErr: "failed to parse debug configmap",
+			step: "test-wf1",
 		},
 		"success": {
 			app: &v1beta1.Application{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "success",
 					Namespace: "default",
+					UID:       "12345",
 				},
-				Spec:   workflowSpec,
-				Status: common.AppStatus{},
+				Spec: workflowSpec,
+				Status: common.AppStatus{
+					Workflow: &common.WorkflowStatus{},
+				},
 			},
 			cm: &corev1.ConfigMap{
 				ObjectMeta: metav1.ObjectMeta{
-					Name:      "success-test-wf1-debug",
+					Name:      "success-test-wf1-debug-12345",
 					Namespace: "default",
 				},
 				Data: map[string]string{
@@ -133,7 +142,9 @@ test: test
 						Properties: &runtime.RawExtension{Raw: []byte(`{"cmd":["sleep","1000"],"image":"busybox"}`)},
 					}},
 				},
-				Status: common.AppStatus{},
+				Status: common.AppStatus{
+					Workflow: &common.WorkflowStatus{},
+				},
 			},
 			step: "test-component",
 		},
@@ -142,7 +153,6 @@ test: test
 	for name, tc := range testCases {
 		t.Run(name, func(t *testing.T) {
 			r := require.New(t)
-
 			d := &debugOpts{
 				step:  tc.step,
 				focus: tc.focus,
@@ -153,7 +163,14 @@ test: test
 				err := client.Create(ctx, tc.cm)
 				r.NoError(err)
 			}
-			err = d.debugApplication(ctx, c, tc.app, ioStream)
+			wargs := &WorkflowArgs{
+				Args: c,
+				Type: instanceTypeApplication,
+				App:  tc.app,
+			}
+			err = wargs.generateWorkflowInstance(ctx, client)
+			r.NoError(err)
+			err = d.debugApplication(ctx, wargs, c, ioStream)
 			if tc.expectedErr != "" {
 				r.Contains(err.Error(), tc.expectedErr)
 				return

@@ -20,6 +20,7 @@ import (
 	context2 "context"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
@@ -33,6 +34,7 @@ import (
 
 	"github.com/oam-dev/kubevela/apis/core.oam.dev/v1beta1"
 	"github.com/oam-dev/kubevela/e2e"
+	"github.com/oam-dev/kubevela/pkg/oam/util"
 	"github.com/oam-dev/kubevela/pkg/utils/common"
 )
 
@@ -42,11 +44,14 @@ var (
 	applicationName             = "app-basic"
 	traitAlias                  = "scaler"
 	appNameForInit              = "initmyapp"
-	jsonAppFile                 = `{"name":"nginx-vela","services":{"nginx":{"type":"webservice","image":"nginx:1.9.4","port":80}}}`
-	testDeleteJsonAppFile       = `{"name":"test-vela-delete","services":{"nginx-test":{"type":"webservice","image":"nginx:1.9.4","port":80}}}`
-	appbasicJsonAppFile         = `{"name":"app-basic","services":{"app-basic":{"type":"webservice","image":"nginx:1.9.4","port":80}}}`
-	appbasicAddTraitJsonAppFile = `{"name":"app-basic","services":{"app-basic":{"type":"webservice","image":"nginx:1.9.4","port":80,"scaler":{"replicas":2}}}}`
+	jsonAppFile                 = `{"name":"nginx-vela","services":{"nginx":{"type":"webservice","image":"nginx:1.9.4","ports":[{port: 80, expose: true}]}}}`
+	testDeleteJsonAppFile       = `{"name":"test-vela-delete","services":{"nginx-test":{"type":"webservice","image":"nginx:1.9.4","ports":[{port: 80, expose: true}]}}}`
+	appbasicJsonAppFile         = `{"name":"app-basic","services":{"app-basic":{"type":"webservice","image":"nginx:1.9.4","ports":[{port: 80, expose: true}]}}}`
+	appbasicAddTraitJsonAppFile = `{"name":"app-basic","services":{"app-basic":{"type":"webservice","image":"nginx:1.9.4","ports":[{port: 80, expose: true}],"scaler":{"replicas":2}}}}`
 	velaQL                      = "test-component-pod-view{appNs=default,appName=nginx-vela,name=nginx}"
+
+	waitAppfileToSuccess = `{"name":"app-wait-success","services":{"app-basic1":{"type":"webservice","image":"nginx:1.9.4","ports":[{port: 80, expose: true}]}}}`
+	waitAppfileToFail    = `{"name":"app-wait-fail","services":{"app-basic2":{"type":"webservice","image":"nginx:fail","ports":[{port: 80, expose: true}]}}}`
 )
 
 var _ = ginkgo.Describe("Test Vela Application", func() {
@@ -73,8 +78,10 @@ var _ = ginkgo.Describe("Test Vela Application", func() {
 	e2e.JsonAppFileContext("json appfile apply", testDeleteJsonAppFile)
 	ApplicationDeleteWithForceOptions("test delete with force option", "test-vela-delete")
 
-	e2e.JsonAppFileContext("json appfile apply", testDeleteJsonAppFile)
 	VelaQLPodListContext("ql", velaQL)
+
+	e2e.JsonAppFileContextWithWait("json appfile apply with wait", waitAppfileToSuccess)
+	e2e.JsonAppFileContextWithTimeout("json appfile apply with wait but timeout", waitAppfileToFail, "3s")
 })
 
 var ApplicationStatusContext = func(context string, applicationName string, workloadType string) bool {
@@ -182,7 +189,7 @@ var ApplicationInitIntercativeCliContext = func(context string, appName string, 
 				c.ExpectEOF()
 			})
 			gomega.Expect(err).NotTo(gomega.HaveOccurred())
-			gomega.Expect(output).To(gomega.ContainSubstring("Checking Status"))
+			gomega.Expect(output).To(gomega.ContainSubstring("Waiting app to be healthy"))
 		})
 	})
 }
@@ -190,10 +197,10 @@ var ApplicationInitIntercativeCliContext = func(context string, appName string, 
 var ApplicationDeleteWithWaitOptions = func(context string, appName string) bool {
 	return ginkgo.Context(context, func() {
 		ginkgo.It("should print successful deletion information", func() {
-			cli := fmt.Sprintf("vela delete %s --wait", appName)
+			cli := fmt.Sprintf("vela delete %s --wait -y", appName)
 			output, err := e2e.ExecAndTerminate(cli)
 			gomega.Expect(err).NotTo(gomega.HaveOccurred())
-			gomega.Expect(output).To(gomega.ContainSubstring("deleted"))
+			gomega.Expect(output).To(gomega.ContainSubstring("succeeded"))
 		})
 	})
 }
@@ -218,7 +225,7 @@ var ApplicationDeleteWithForceOptions = func(context string, appName string) boo
 				return k8sClient.Update(ctx, app)
 			}, time.Second*3, time.Millisecond*300).Should(gomega.BeNil())
 
-			cli := fmt.Sprintf("vela delete %s --force", appName)
+			cli := fmt.Sprintf("vela delete %s --force -y", appName)
 			output, err := e2e.LongTimeExec(cli, 3*time.Minute)
 			gomega.Expect(err).NotTo(gomega.HaveOccurred())
 			gomega.Expect(output).To(gomega.ContainSubstring("timed out"))
@@ -230,7 +237,7 @@ var ApplicationDeleteWithForceOptions = func(context string, appName string) boo
 				g.Expect(k8sClient.Update(ctx, app)).Should(gomega.Succeed())
 			}, time.Second*5, time.Millisecond*300).Should(gomega.Succeed())
 
-			cli = fmt.Sprintf("vela delete %s --force", appName)
+			cli = fmt.Sprintf("vela delete %s --force -y", appName)
 			output, err = e2e.ExecAndTerminate(cli)
 			gomega.Expect(err).NotTo(gomega.HaveOccurred())
 			gomega.Expect(output).To(gomega.ContainSubstring("deleted"))
@@ -277,11 +284,16 @@ var VelaQLPodListContext = func(context string, velaQL string) bool {
 			componentView := new(corev1.ConfigMap)
 			gomega.Eventually(func(g gomega.Gomega) {
 				g.Expect(common.ReadYamlToObject("./component-pod-view.yaml", componentView)).Should(gomega.BeNil())
-				g.Expect(k8sClient.Create(ctx, componentView)).Should(gomega.Succeed())
+				g.Expect(k8sClient.Create(ctx, componentView)).Should(gomega.SatisfyAny(gomega.Succeed(), util.AlreadyExistMatcher{}))
 			}, time.Second*3, time.Millisecond*300).Should(gomega.Succeed())
 
 			cli := fmt.Sprintf("vela ql %s", velaQL)
 			output, err := e2e.Exec(cli)
+
+			// remove warning like: W0406 14:07:49.832144 2443978 tree.go:958] ignore list resources: EndpointSlice as no matches for kind "EndpointSlice" in version "discovery.k8s.io/v1beta1"
+			re := regexp.MustCompile(`W\d{4}.*`)
+			output = re.ReplaceAllString(output, "")
+
 			gomega.Expect(err).NotTo(gomega.HaveOccurred())
 			var list PodList
 			err = json.Unmarshal([]byte(output), &list)
@@ -294,7 +306,7 @@ var VelaQLPodListContext = func(context string, velaQL string) bool {
 					gomega.Expect(v.Status.Phase).To(gomega.ContainSubstring("Running"))
 				}
 				if v.Status.NodeName != "" {
-					gomega.Expect(v.Status.NodeName).To(gomega.ContainSubstring("kind-control-plane"))
+					gomega.Expect(v.Status.NodeName).To(gomega.ContainSubstring("k3d-k3s-default-server-0"))
 				}
 				if v.Metadata.Namespace != "" {
 					gomega.Expect(v.Metadata.Namespace).To(gomega.ContainSubstring("default"))
@@ -303,7 +315,7 @@ var VelaQLPodListContext = func(context string, velaQL string) bool {
 					gomega.Expect(v.Workload.ApiVersion).To(gomega.ContainSubstring("apps/v1"))
 				}
 				if v.Workload.Kind != "" {
-					gomega.Expect(v.Workload.Kind).To(gomega.ContainSubstring("Deployment"))
+					gomega.Expect(v.Workload.Kind).To(gomega.ContainSubstring("ReplicaSet"))
 				}
 			}
 		})

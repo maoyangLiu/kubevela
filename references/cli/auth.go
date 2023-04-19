@@ -31,8 +31,6 @@ import (
 	"k8s.io/kubectl/pkg/util/i18n"
 	"k8s.io/kubectl/pkg/util/templates"
 
-	prismclusterv1alpha1 "github.com/kubevela/prism/pkg/apis/cluster/v1alpha1"
-
 	"github.com/oam-dev/kubevela/apis/types"
 	"github.com/oam-dev/kubevela/pkg/auth"
 	velacmd "github.com/oam-dev/kubevela/pkg/cmd"
@@ -144,7 +142,7 @@ func NewGenKubeConfigCommand(f velacmd.Factory, streams util.IOStreams) *cobra.C
 		Annotations: map[string]string{
 			types.TagCommandType: types.TypeCD,
 		},
-		Args: cobra.ExactValidArgs(0),
+		Args: cobra.ExactArgs(0),
 		Run: func(cmd *cobra.Command, args []string) {
 			o.Complete(f, cmd)
 			cmdutil.CheckErr(o.Validate())
@@ -198,7 +196,7 @@ func (opt *ListPrivilegesOptions) Validate(f velacmd.Factory, cmd *cobra.Command
 		return err
 	}
 	for _, cluster := range opt.Clusters {
-		if _, err := prismclusterv1alpha1.NewClusterClient(f.Client()).Get(cmd.Context(), cluster); err != nil {
+		if _, err := multicluster.NewClusterClient(f.Client()).Get(cmd.Context(), cluster); err != nil {
 			return fmt.Errorf("failed to find cluster %s: %w", cluster, err)
 		}
 	}
@@ -271,7 +269,7 @@ func NewListPrivilegesCommand(f velacmd.Factory, streams util.IOStreams) *cobra.
 		Annotations: map[string]string{
 			types.TagCommandType: types.TypeCD,
 		},
-		Args: cobra.ExactValidArgs(0),
+		Args: cobra.ExactArgs(0),
 		Run: func(cmd *cobra.Command, args []string) {
 			o.Complete(f, cmd)
 			cmdutil.CheckErr(o.Validate(f, cmd))
@@ -334,7 +332,7 @@ func (opt *GrantPrivilegesOptions) Validate(f velacmd.Factory, cmd *cobra.Comman
 		return fmt.Errorf("at least one idenity (user/group/serviceaccount) should be set")
 	}
 	for _, cluster := range opt.GrantClusters {
-		if _, err := prismclusterv1alpha1.NewClusterClient(f.Client()).Get(cmd.Context(), cluster); err != nil {
+		if _, err := multicluster.NewClusterClient(f.Client()).Get(cmd.Context(), cluster); err != nil {
 			return fmt.Errorf("failed to find cluster %s: %w", cluster, err)
 		}
 		if !opt.CreateNamespace {
@@ -353,7 +351,7 @@ func (opt *GrantPrivilegesOptions) Run(f velacmd.Factory, cmd *cobra.Command) er
 	ctx := cmd.Context()
 	if opt.CreateNamespace {
 		for _, cluster := range opt.GrantClusters {
-			if _, err := prismclusterv1alpha1.NewClusterClient(f.Client()).Get(cmd.Context(), cluster); err != nil {
+			if _, err := multicluster.NewClusterClient(f.Client()).Get(cmd.Context(), cluster); err != nil {
 				return fmt.Errorf("failed to find cluster %s: %w", cluster, err)
 			}
 			for _, namespace := range opt.GrantNamespaces {
@@ -442,7 +440,7 @@ func NewGrantPrivilegesCommand(f velacmd.Factory, streams util.IOStreams) *cobra
 		Annotations: map[string]string{
 			types.TagCommandType: types.TypeCD,
 		},
-		Args: cobra.ExactValidArgs(0),
+		Args: cobra.ExactArgs(0),
 		Run: func(cmd *cobra.Command, args []string) {
 			o.Complete(f, cmd)
 			cmdutil.CheckErr(o.Validate(f, cmd))

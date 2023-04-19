@@ -36,14 +36,16 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	"github.com/kubevela/workflow/pkg/cue/process"
 	terraformtypes "github.com/oam-dev/terraform-controller/api/types"
 	terraformapi "github.com/oam-dev/terraform-controller/api/v1beta2"
 
 	"github.com/oam-dev/kubevela/apis/core.oam.dev/v1alpha2"
 	oamtypes "github.com/oam-dev/kubevela/apis/types"
 	af "github.com/oam-dev/kubevela/pkg/appfile"
-	"github.com/oam-dev/kubevela/pkg/cue/process"
+	velaprocess "github.com/oam-dev/kubevela/pkg/cue/process"
 	"github.com/oam-dev/kubevela/pkg/oam"
+	"github.com/oam-dev/kubevela/pkg/oam/util"
 )
 
 const (
@@ -454,7 +456,7 @@ func CUEBasedHealthCheck(ctx context.Context, c client.Client, wlRef WorkloadRef
 			wlHealth.Diagnosis = configuration.Status.Apply.Message
 			okToCheckTrait = true
 		default:
-			pCtx = process.NewContext(af.GenerateContextDataFromAppFile(appfile, wl.Name))
+			pCtx = velaprocess.NewContext(af.GenerateContextDataFromAppFile(appfile, wl.Name))
 			pCtx.SetCtx(ctx)
 			if wl.CapabilityCategory != oamtypes.CUECategory {
 				templateStr, err := af.GenerateCUETemplate(wl)
@@ -478,7 +480,14 @@ func CUEBasedHealthCheck(ctx context.Context, c client.Client, wlRef WorkloadRef
 				okToCheckTrait = true
 				return
 			}
-			isHealthy, err := wl.EvalHealth(pCtx, c, ns)
+			accessor := util.NewApplicationResourceNamespaceAccessor(ns, "")
+			templateContext, err := wl.GetTemplateContext(pCtx, c, accessor)
+			if err != nil {
+				wlHealth.HealthStatus = StatusUnhealthy
+				wlHealth.Diagnosis = errors.Wrap(err, errHealthCheck).Error()
+				return
+			}
+			isHealthy, err := wl.EvalHealth(templateContext)
 			if err != nil {
 				wlHealth.HealthStatus = StatusUnhealthy
 				wlHealth.Diagnosis = errors.Wrap(err, errHealthCheck).Error()
@@ -490,7 +499,7 @@ func CUEBasedHealthCheck(ctx context.Context, c client.Client, wlRef WorkloadRef
 				// TODO(wonderflow): we should add a custom way to let the template say why it's unhealthy, only a bool flag is not enough
 				wlHealth.HealthStatus = StatusUnhealthy
 			}
-			wlHealth.CustomStatusMsg, err = wl.EvalStatus(pCtx, c, ns)
+			wlHealth.CustomStatusMsg, err = wl.EvalStatus(templateContext)
 			if err != nil {
 				wlHealth.Diagnosis = errors.Wrap(err, errHealthCheck).Error()
 			}
@@ -522,7 +531,15 @@ func CUEBasedHealthCheck(ctx context.Context, c client.Client, wlRef WorkloadRef
 			traits[i] = tHealth
 			continue
 		}
-		isHealthy, err := tr.EvalHealth(pCtx, c, ns)
+		accessor := util.NewApplicationResourceNamespaceAccessor("", ns)
+		templateContext, err := tr.GetTemplateContext(pCtx, c, accessor)
+		if err != nil {
+			tHealth.HealthStatus = StatusUnhealthy
+			tHealth.Diagnosis = errors.Wrap(err, errHealthCheck).Error()
+			traits[i] = tHealth
+			continue
+		}
+		isHealthy, err := tr.EvalHealth(templateContext)
 		if err != nil {
 			tHealth.HealthStatus = StatusUnhealthy
 			tHealth.Diagnosis = errors.Wrap(err, errHealthCheck).Error()
@@ -535,7 +552,7 @@ func CUEBasedHealthCheck(ctx context.Context, c client.Client, wlRef WorkloadRef
 			// TODO(wonderflow): we should add a custom way to let the template say why it's unhealthy, only a bool flag is not enough
 			tHealth.HealthStatus = StatusUnhealthy
 		}
-		tHealth.CustomStatusMsg, err = tr.EvalStatus(pCtx, c, ns)
+		tHealth.CustomStatusMsg, err = tr.EvalStatus(templateContext)
 		if err != nil {
 			tHealth.Diagnosis = errors.Wrap(err, errHealthCheck).Error()
 		}

@@ -19,7 +19,7 @@ package e2e_multicluster_test
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
+	"os"
 	"time"
 
 	. "github.com/onsi/ginkgo"
@@ -35,21 +35,28 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/yaml"
 
+	workflowv1alpha1 "github.com/kubevela/workflow/api/v1alpha1"
+
 	oamcomm "github.com/oam-dev/kubevela/apis/core.oam.dev/common"
 	"github.com/oam-dev/kubevela/apis/core.oam.dev/v1alpha1"
 	"github.com/oam-dev/kubevela/apis/core.oam.dev/v1beta1"
 	"github.com/oam-dev/kubevela/pkg/controller/core.oam.dev/v1alpha2/application"
 	"github.com/oam-dev/kubevela/pkg/oam"
+	"github.com/oam-dev/kubevela/pkg/workflow/operation"
 )
 
 var _ = Describe("Test multicluster standalone scenario", func() {
-
+	waitObject := func(ctx context.Context, un unstructured.Unstructured) {
+		Eventually(func(g Gomega) error {
+			return k8sClient.Get(ctx, client.ObjectKeyFromObject(&un), &un)
+		}, 10*time.Second).Should(Succeed())
+	}
 	var namespace string
 	var hubCtx context.Context
 	var workerCtx context.Context
 
 	readFile := func(filename string) *unstructured.Unstructured {
-		bs, err := ioutil.ReadFile("./testdata/app/standalone/" + filename)
+		bs, err := os.ReadFile("./testdata/app/standalone/" + filename)
 		Expect(err).Should(Succeed())
 		un := &unstructured.Unstructured{}
 		Expect(yaml.Unmarshal(bs, un)).Should(Succeed())
@@ -59,7 +66,9 @@ var _ = Describe("Test multicluster standalone scenario", func() {
 
 	applyFile := func(filename string) {
 		un := readFile(filename)
-		Expect(k8sClient.Create(context.Background(), un)).Should(Succeed())
+		Eventually(func(g Gomega) {
+			g.Expect(k8sClient.Create(context.Background(), un)).Should(Succeed())
+		}).WithTimeout(10 * time.Second).WithPolling(2 * time.Second).Should(Succeed())
 	}
 
 	BeforeEach(func() {
@@ -91,8 +100,10 @@ var _ = Describe("Test multicluster standalone scenario", func() {
 
 		Eventually(func(g Gomega) {
 			app := &v1beta1.Application{}
-			Expect(k8sClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: "podinfo"}, app)).Should(Succeed())
-			Expect(k8sClient.Delete(context.Background(), app)).Should(Succeed())
+			g.Expect(k8sClient.Get(context.Background(), types.NamespacedName{Namespace: namespace, Name: "podinfo"}, app)).Should(Succeed())
+			g.Expect(app.Status.Workflow).ShouldNot(BeNil())
+			g.Expect(app.Status.Workflow.Mode).Should(Equal("DAG-DAG"))
+			g.Expect(k8sClient.Delete(context.Background(), app)).Should(Succeed())
 		}, 15*time.Second).Should(Succeed())
 
 		Eventually(func(g Gomega) {
@@ -107,14 +118,26 @@ var _ = Describe("Test multicluster standalone scenario", func() {
 
 	It("Test standalone app with publish version", func() {
 		By("Apply resources")
+
+		nsLocal := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace + "-local"}}
+		Expect(k8sClient.Create(hubCtx, nsLocal)).Should(Succeed())
+		defer func() {
+			_ = k8sClient.Delete(hubCtx, nsLocal)
+		}()
+
 		deploy := readFile("deployment.yaml")
 		Expect(k8sClient.Create(hubCtx, deploy)).Should(Succeed())
+		waitObject(hubCtx, *deploy)
 		workflow := readFile("workflow-suspend.yaml")
 		Expect(k8sClient.Create(hubCtx, workflow)).Should(Succeed())
+		waitObject(hubCtx, *workflow)
 		policy := readFile("policy-zero-replica.yaml")
 		Expect(k8sClient.Create(hubCtx, policy)).Should(Succeed())
+		waitObject(hubCtx, *policy)
 		app := readFile("app-with-publish-version.yaml")
-		Expect(k8sClient.Create(hubCtx, app)).Should(Succeed())
+		Eventually(func(g Gomega) {
+			g.Expect(k8sClient.Create(hubCtx, app)).Should(Succeed())
+		}).WithTimeout(10 * time.Second).WithPolling(2 * time.Second).Should(Succeed())
 		appKey := client.ObjectKeyFromObject(app)
 
 		Eventually(func(g Gomega) {
@@ -129,13 +152,7 @@ var _ = Describe("Test multicluster standalone scenario", func() {
 		Eventually(func(g Gomega) {
 			_app := &v1beta1.Application{}
 			g.Expect(k8sClient.Get(hubCtx, appKey, _app)).Should(Succeed())
-			_app.Status.Workflow.Suspend = false
-			for i, step := range _app.Status.Workflow.Steps {
-				if step.Type == "suspend" {
-					_app.Status.Workflow.Steps[i].Phase = oamcomm.WorkflowStepPhaseSucceeded
-				}
-			}
-			g.Expect(k8sClient.Status().Update(hubCtx, _app)).Should(Succeed())
+			g.Expect(operation.ResumeWorkflow(hubCtx, k8sClient, _app, "")).Should(Succeed())
 		}, 15*time.Second).Should(Succeed())
 
 		// test application can run without external policies and workflow since they are recorded in the application revision
@@ -152,7 +169,7 @@ var _ = Describe("Test multicluster standalone scenario", func() {
 		// update application without updating publishVersion
 		Eventually(func(g Gomega) {
 			g.Expect(k8sClient.Get(hubCtx, appKey, _app)).Should(Succeed())
-			_app.Spec.Policies[0].Properties = &runtime.RawExtension{Raw: []byte(`{"clusters":["local"]}`)}
+			_app.Spec.Policies[0].Properties = &runtime.RawExtension{Raw: []byte(fmt.Sprintf(`{"clusters":["local"],"namespace":"%s"}`, nsLocal.Name))}
 			g.Expect(k8sClient.Update(hubCtx, _app)).Should(Succeed())
 		}, 10*time.Second).Should(Succeed())
 
@@ -181,7 +198,7 @@ var _ = Describe("Test multicluster standalone scenario", func() {
 			deploys := &v1.DeploymentList{}
 			g.Expect(k8sClient.List(workerCtx, deploys, client.InNamespace(namespace))).Should(Succeed())
 			g.Expect(len(deploys.Items)).Should(Equal(0))
-			g.Expect(k8sClient.List(hubCtx, deploys, client.InNamespace(namespace))).Should(Succeed())
+			g.Expect(k8sClient.List(hubCtx, deploys, client.InNamespace(nsLocal.Name))).Should(Succeed())
 			g.Expect(len(deploys.Items)).Should(Equal(1))
 			g.Expect(deploys.Items[0].Spec.Replicas).Should(Equal(pointer.Int32(3)))
 		}, 30*time.Second).Should(Succeed())
@@ -262,10 +279,14 @@ var _ = Describe("Test multicluster standalone scenario", func() {
 		))
 
 		By("Rollback application")
-		_, err = execCommand("workflow", "suspend", "busybox", "-n", namespace)
-		Expect(err).Should(Succeed())
-		_, err = execCommand("workflow", "rollback", "busybox", "-n", namespace)
-		Expect(err).Should(Succeed())
+		Eventually(func(g Gomega) {
+			_, err = execCommand("workflow", "suspend", "busybox", "-n", namespace)
+			g.Expect(err).Should(Succeed())
+		}).WithTimeout(10 * time.Second).Should(Succeed())
+		Eventually(func(g Gomega) {
+			_, err = execCommand("workflow", "rollback", "busybox", "-n", namespace)
+			g.Expect(err).Should(Succeed())
+		}).WithTimeout(10 * time.Second).Should(Succeed())
 
 		Eventually(func(g Gomega) {
 			g.Expect(k8sClient.Get(hubCtx, appKey, app)).Should(Succeed())
@@ -278,7 +299,7 @@ var _ = Describe("Test multicluster standalone scenario", func() {
 			revs, err := application.GetSortedAppRevisions(hubCtx, k8sClient, app.Name, namespace)
 			g.Expect(err).Should(Succeed())
 			g.Expect(len(revs)).Should(Equal(1))
-		})
+		}).WithTimeout(time.Minute).WithPolling(2 * time.Second).Should(Succeed())
 	})
 
 	It("Test large application parallel apply and delete", func() {
@@ -297,10 +318,12 @@ var _ = Describe("Test multicluster standalone scenario", func() {
 			Properties: &runtime.RawExtension{Raw: []byte(fmt.Sprintf(`{"clusters":["%s"]}`, WorkerClusterName))},
 		})
 		newApp.Spec.Workflow = &v1beta1.Workflow{
-			Steps: []v1beta1.WorkflowStep{{
-				Name:       "deploy",
-				Type:       "deploy",
-				Properties: &runtime.RawExtension{Raw: []byte(`{"policies":["topology-deploy"],"parallelism":10}`)},
+			Steps: []workflowv1alpha1.WorkflowStep{{
+				WorkflowStepBase: workflowv1alpha1.WorkflowStepBase{
+					Name:       "deploy",
+					Type:       "deploy",
+					Properties: &runtime.RawExtension{Raw: []byte(`{"policies":["topology-deploy"],"parallelism":10}`)},
+				},
 			}},
 		}
 		Expect(k8sClient.Create(context.Background(), newApp)).Should(Succeed())
@@ -321,5 +344,36 @@ var _ = Describe("Test multicluster standalone scenario", func() {
 			err := k8sClient.Get(context.Background(), client.ObjectKeyFromObject(newApp), app)
 			g.Expect(errors.IsNotFound(err)).Should(BeTrue())
 		}, time.Minute).Should(Succeed())
+	})
+
+	It("Test ref-objects with url", func() {
+		newApp := &v1beta1.Application{
+			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "app"},
+			Spec: v1beta1.ApplicationSpec{
+				Components: []oamcomm.ApplicationComponent{{
+					Name:       "example",
+					Type:       "ref-objects",
+					Properties: &runtime.RawExtension{Raw: []byte(`{"urls":["https://gist.githubusercontent.com/Somefive/b189219a9222eaa70b8908cf4379402b/raw/920e83b1a2d56b584f9d8c7a97810a505a0bbaad/example-busybox-resources.yaml"]}`)},
+				}},
+			},
+		}
+
+		By("Create application")
+		Expect(k8sClient.Create(hubCtx, newApp)).Should(Succeed())
+		Eventually(func(g Gomega) {
+			g.Expect(k8sClient.Get(hubCtx, client.ObjectKeyFromObject(newApp), newApp)).Should(Succeed())
+			g.Expect(newApp.Status.Phase).Should(Equal(oamcomm.ApplicationRunning))
+		}, 15*time.Second).Should(Succeed())
+		key := types.NamespacedName{Namespace: namespace, Name: "busybox"}
+		Expect(k8sClient.Get(hubCtx, key, &v1.Deployment{})).Should(Succeed())
+		Expect(k8sClient.Get(hubCtx, key, &corev1.ConfigMap{})).Should(Succeed())
+
+		By("Delete application")
+		Expect(k8sClient.Delete(hubCtx, newApp)).Should(Succeed())
+		Eventually(func(g Gomega) {
+			g.Expect(k8sClient.Get(hubCtx, client.ObjectKeyFromObject(newApp), newApp)).Should(Satisfy(errors.IsNotFound))
+		}, 15*time.Second).Should(Succeed())
+		Expect(k8sClient.Get(hubCtx, key, &v1.Deployment{})).Should(Satisfy(errors.IsNotFound))
+		Expect(k8sClient.Get(hubCtx, key, &corev1.ConfigMap{})).Should(Satisfy(errors.IsNotFound))
 	})
 })

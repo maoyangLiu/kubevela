@@ -40,8 +40,10 @@ import (
 	"github.com/oam-dev/kubevela/pkg/monitor/metrics"
 	"github.com/oam-dev/kubevela/pkg/multicluster"
 	"github.com/oam-dev/kubevela/pkg/oam"
+	"github.com/oam-dev/kubevela/pkg/oam/util"
 	"github.com/oam-dev/kubevela/pkg/resourcetracker"
 	"github.com/oam-dev/kubevela/pkg/utils"
+	"github.com/oam-dev/kubevela/pkg/utils/apply"
 	version2 "github.com/oam-dev/kubevela/version"
 )
 
@@ -81,12 +83,14 @@ func newGCConfig(options ...GCOption) *gcConfig {
 // 1. Mark Stage
 // Controller will find all resourcetrackers for the target application and decide which resourcetrackers should be
 // deleted. Decision rules including:
-//    a. rootRT and currentRT will be marked as deleted only when application is marked as deleted (DeleteTimestamp is
-//       not nil).
-//    b. historyRTs will be marked as deleted if at least one of the below conditions met
-//       i.  GarbageCollectionMode is not set to `passive`
-//       ii. All managed resources are RECYCLED. (RECYCLED means resource does not exist or managed by latest
-//           resourcetrackers)
+//
+//	a. rootRT and currentRT will be marked as deleted only when application is marked as deleted (DeleteTimestamp is
+//	   not nil).
+//	b. historyRTs will be marked as deleted if at least one of the below conditions met
+//	   i.  GarbageCollectionMode is not set to `passive`
+//	   ii. All managed resources are RECYCLED. (RECYCLED means resource does not exist or managed by latest
+//	       resourcetrackers)
+//
 // NOTE: Mark Stage will always work for each application reconcile, not matter whether workflow is ended
 //
 // 2. Sweep Stage
@@ -97,7 +101,8 @@ func newGCConfig(options ...GCOption) *gcConfig {
 // Controller will finalize all resourcetrackers marked to be deleted. All managed resources are recycled.
 //
 // NOTE: Mark Stage will only work when Workflow succeeds. Check/Finalize Stage will always work.
-//       For one single application, the deletion will follow Mark -> Finalize -> Sweep
+//
+//	For one single application, the deletion will follow Mark -> Finalize -> Sweep
 func (h *resourceKeeper) GarbageCollect(ctx context.Context, options ...GCOption) (finished bool, waiting []v1beta1.ManagedResource, err error) {
 	if h.garbageCollectPolicy != nil {
 		if h.garbageCollectPolicy.KeepLegacyResource {
@@ -159,14 +164,29 @@ func (h *gcHandler) monitor(stage string) func() {
 	begin := time.Now()
 	return func() {
 		v := time.Since(begin).Seconds()
-		metrics.GCResourceTrackersDurationHistogram.WithLabelValues(stage).Observe(v)
+		metrics.AppReconcileStageDurationHistogram.WithLabelValues("gc-rt." + stage).Observe(v)
+	}
+}
+
+func (h *gcHandler) regularizeResourceTracker(rts ...*v1beta1.ResourceTracker) {
+	for _, rt := range rts {
+		if rt == nil {
+			continue
+		}
+		for i, mr := range rt.Spec.ManagedResources {
+			if ok, err := utils.IsClusterScope(mr.GroupVersionKind(), h.Client.RESTMapper()); err == nil && ok {
+				rt.Spec.ManagedResources[i].Namespace = ""
+			}
+		}
 	}
 }
 
 func (h *gcHandler) Init() {
 	cb := h.monitor("init")
 	defer cb()
-	h.cache.registerResourceTrackers(append(h._historyRTs, h._currentRT, h._rootRT)...)
+	rts := append(h._historyRTs, h._currentRT, h._rootRT) // nolint
+	h.regularizeResourceTracker(rts...)
+	h.cache.registerResourceTrackers(rts...)
 }
 
 func (h *gcHandler) scan(ctx context.Context) (inactiveRTs []*v1beta1.ResourceTracker) {
@@ -309,6 +329,23 @@ func (h *gcHandler) deleteIndependentComponent(ctx context.Context, mr v1beta1.M
 	return nil
 }
 
+// UpdateSharedManagedResourceOwner update owner & sharer labels for managed resource
+func UpdateSharedManagedResourceOwner(ctx context.Context, cli client.Client, manifest *unstructured.Unstructured, sharedBy string) error {
+	parts := strings.Split(apply.FirstSharer(sharedBy), "/")
+	appName, appNs := "", metav1.NamespaceDefault
+	if len(parts) == 1 {
+		appName = parts[0]
+	} else if len(parts) == 2 {
+		appName, appNs = parts[1], parts[0]
+	}
+	util.AddAnnotations(manifest, map[string]string{oam.AnnotationAppSharedBy: sharedBy})
+	util.AddLabels(manifest, map[string]string{
+		oam.LabelAppName:      appName,
+		oam.LabelAppNamespace: appNs,
+	})
+	return cli.Update(ctx, manifest)
+}
+
 func (h *gcHandler) deleteManagedResource(ctx context.Context, mr v1beta1.ManagedResource, rt *v1beta1.ResourceTracker) error {
 	entry := h.cache.get(ctx, mr)
 	if entry.gcExecutorRT != rt {
@@ -318,9 +355,34 @@ func (h *gcHandler) deleteManagedResource(ctx context.Context, mr v1beta1.Manage
 		return entry.err
 	}
 	if entry.exists {
-		if err := h.Client.Delete(multicluster.ContextWithClusterName(ctx, mr.Cluster), entry.obj); err != nil && !kerrors.IsNotFound(err) {
-			return errors.Wrapf(err, "failed to delete resource %s", mr.ResourceKey())
+		return DeleteManagedResourceInApplication(ctx, h.Client, mr, entry.obj, h.app)
+	}
+	return nil
+}
+
+// DeleteManagedResourceInApplication delete managed resource in application
+func DeleteManagedResourceInApplication(ctx context.Context, cli client.Client, mr v1beta1.ManagedResource, obj *unstructured.Unstructured, app *v1beta1.Application) error {
+	_ctx := multicluster.ContextWithClusterName(ctx, mr.Cluster)
+	if annotations := obj.GetAnnotations(); annotations != nil && annotations[oam.AnnotationAppSharedBy] != "" {
+		sharedBy := apply.RemoveSharer(annotations[oam.AnnotationAppSharedBy], app)
+		if sharedBy != "" {
+			if err := UpdateSharedManagedResourceOwner(_ctx, cli, obj, sharedBy); err != nil {
+				return errors.Wrapf(err, "failed to remove sharer from resource %s", mr.ResourceKey())
+			}
+			return nil
 		}
+		util.RemoveAnnotations(obj, []string{oam.AnnotationAppSharedBy})
+	}
+	if mr.SkipGC || hasOrphanFinalizer(app) {
+		if labels := obj.GetLabels(); labels != nil {
+			delete(labels, oam.LabelAppName)
+			delete(labels, oam.LabelAppNamespace)
+			obj.SetLabels(labels)
+		}
+		return errors.Wrapf(cli.Update(_ctx, obj), "failed to remove owner labels for resource while skipping gc")
+	}
+	if err := cli.Delete(_ctx, obj); err != nil && !kerrors.IsNotFound(err) {
+		return errors.Wrapf(err, "failed to delete resource %s", mr.ResourceKey())
 	}
 	return nil
 }
@@ -372,7 +434,7 @@ func (h *gcHandler) GarbageCollectComponentRevisionResourceTracker(ctx context.C
 		return nil
 	}
 	inUseComponents := map[string]bool{}
-	for _, entry := range h.cache.m {
+	for _, entry := range h.cache.m.Data() {
 		for _, rt := range entry.usedBy {
 			if rt.GetDeletionTimestamp() == nil || len(rt.GetFinalizers()) != 0 {
 				inUseComponents[entry.mr.ComponentKey()] = true
@@ -437,7 +499,7 @@ func (h *gcHandler) GarbageCollectLegacyResourceTrackers(ctx context.Context) er
 		}
 	}
 	for _, policy := range h.app.Spec.Policies {
-		if policy.Type == v1alpha1.EnvBindingPolicyType {
+		if policy.Type == v1alpha1.EnvBindingPolicyType && policy.Properties != nil {
 			spec := &v1alpha1.EnvBindingSpec{}
 			if err = json.Unmarshal(policy.Properties.Raw, &spec); err == nil {
 				for _, env := range spec.Envs {

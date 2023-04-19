@@ -29,9 +29,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
+	"github.com/kubevela/workflow/pkg/cue/packages"
+
 	"github.com/oam-dev/kubevela/apis/core.oam.dev/v1beta1"
 	controller "github.com/oam-dev/kubevela/pkg/controller/core.oam.dev"
-	"github.com/oam-dev/kubevela/pkg/cue/packages"
 	"github.com/oam-dev/kubevela/pkg/oam/discoverymapper"
 	"github.com/oam-dev/kubevela/pkg/oam/util"
 )
@@ -96,7 +97,9 @@ func (h *ValidatingHandler) Handle(ctx context.Context, req admission.Request) a
 	switch req.Operation {
 	case admissionv1.Create:
 		if allErrs := h.ValidateCreate(ctx, app); len(allErrs) > 0 {
-			return admission.Errored(http.StatusUnprocessableEntity, mergeErrors(allErrs))
+			// http.StatusUnprocessableEntity will NOT report any error descriptions
+			// to the client, use generic http.StatusBadRequest instead.
+			return admission.Errored(http.StatusBadRequest, mergeErrors(allErrs))
 		}
 	case admissionv1.Update:
 		oldApp := &v1beta1.Application{}
@@ -105,7 +108,7 @@ func (h *ValidatingHandler) Handle(ctx context.Context, req admission.Request) a
 		}
 		if app.ObjectMeta.DeletionTimestamp.IsZero() {
 			if allErrs := h.ValidateUpdate(ctx, app, oldApp); len(allErrs) > 0 {
-				return admission.Errored(http.StatusUnprocessableEntity, mergeErrors(allErrs))
+				return admission.Errored(http.StatusBadRequest, mergeErrors(allErrs))
 			}
 		}
 	default:

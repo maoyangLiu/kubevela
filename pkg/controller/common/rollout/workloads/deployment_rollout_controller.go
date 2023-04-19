@@ -151,7 +151,7 @@ func (c *DeploymentRolloutController) Initialize(ctx context.Context) (bool, err
 
 	// claim target deployment
 	// make sure we start with the matching replicas and target
-	targetInitSize := pointer.Int32Ptr(c.rolloutStatus.RolloutTargetSize - getDeploymentReplicas(&c.sourceDeploy))
+	targetInitSize := pointer.Int32(c.rolloutStatus.RolloutTargetSize - getDeploymentReplicas(&c.sourceDeploy))
 	if _, err := c.claimDeployment(ctx, &c.targetDeploy, targetInitSize); err != nil {
 		// nolint:nilerr
 		return false, nil
@@ -291,9 +291,12 @@ func (c *DeploymentRolloutController) Finalize(ctx context.Context, succeed bool
 	return true
 }
 
-/* ----------------------------------
+/*
+	----------------------------------
+
 The functions below are helper functions
-------------------------------------- */
+-------------------------------------
+*/
 func (c *DeploymentRolloutController) fetchDeployments(ctx context.Context) error {
 	if err := c.client.Get(ctx, c.sourceNamespacedName, &c.sourceDeploy); err != nil {
 		if !apierrors.IsNotFound(err) {

@@ -17,34 +17,37 @@ limitations under the License.
 package query
 
 import (
-	"fmt"
+	"context"
 	"testing"
 	"time"
-
-	"github.com/oam-dev/kubevela/apis/core.oam.dev/common"
-	"github.com/oam-dev/kubevela/apis/core.oam.dev/v1beta1"
-	types3 "github.com/oam-dev/kubevela/apis/types"
-	"github.com/oam-dev/kubevela/pkg/cue/model/value"
-	"github.com/oam-dev/kubevela/pkg/oam"
-	"github.com/oam-dev/kubevela/pkg/oam/util"
-	"github.com/oam-dev/kubevela/pkg/velaql/providers/query/types"
 
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 
-	v12 "k8s.io/api/apps/v1"
-	v1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime"
-	types2 "k8s.io/apimachinery/pkg/types"
-	"k8s.io/utils/pointer"
-
-	"sigs.k8s.io/controller-runtime/pkg/client"
-
 	"github.com/fluxcd/helm-controller/api/v2beta1"
 	"github.com/fluxcd/source-controller/api/v1beta2"
 	"github.com/stretchr/testify/assert"
+	v12 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
+	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/serializer/yaml"
+	types2 "k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/pointer"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	monitorContext "github.com/kubevela/pkg/monitor/context"
+	"github.com/kubevela/workflow/pkg/cue/model/value"
+
+	"github.com/oam-dev/kubevela/apis/core.oam.dev/common"
+	"github.com/oam-dev/kubevela/apis/core.oam.dev/v1beta1"
+	types3 "github.com/oam-dev/kubevela/apis/types"
+	"github.com/oam-dev/kubevela/pkg/oam"
+	"github.com/oam-dev/kubevela/pkg/oam/util"
+	"github.com/oam-dev/kubevela/pkg/velaql/providers/query/types"
 )
 
 func TestPodStatus(t *testing.T) {
@@ -201,6 +204,91 @@ func TestService2EndpointOption(t *testing.T) {
 	assert.Equal(t, "service-name=test,uid=test-uid", l.LabelSelector.String())
 }
 
+func TestConvertLabel2Selector(t *testing.T) {
+	cronJob1 := `
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: cronjob1
+  labels:
+    app: cronjob1
+spec:
+  schedule: "* * * * *"
+  jobTemplate:
+    metadata:
+      labels:
+        app: cronJob1
+    spec:
+      template:
+        spec:
+          containers:
+          - name: cronjob
+            image: busybox
+            command: ["/bin/sh","-c","date"]
+          restartPolicy: Never 
+`
+	obj := unstructured.Unstructured{}
+	dec := yaml.NewDecodingSerializer(unstructured.UnstructuredJSONScheme)
+	_, _, err := dec.Decode([]byte(cronJob1), nil, &obj)
+	assert.NoError(t, err)
+	workload1 := WorkloadUnstructured{obj}
+	selector1, err := workload1.convertLabel2Selector("not", "exist")
+	assert.Equal(t, selector1, labels.Everything())
+	assert.NoError(t, err)
+
+	selector2, err := workload1.convertLabel2Selector()
+	assert.Equal(t, selector2, nil)
+	assert.Error(t, err)
+
+	_, _, err = dec.Decode([]byte(cronJob1), nil, &obj)
+	assert.NoError(t, err)
+	workload2 := WorkloadUnstructured{obj}
+	selector3, err := workload2.convertLabel2Selector("apiVersion")
+	assert.Equal(t, selector3, labels.Everything())
+	assert.NoError(t, err)
+
+	_, _, err = dec.Decode([]byte(cronJob1), nil, &obj)
+	assert.NoError(t, err)
+	workload3 := WorkloadUnstructured{obj}
+	selector4, err := workload3.convertLabel2Selector("spec", "jobTemplate", "metadata", "labels")
+	assert.Equal(t, selector4.String(), "app=cronJob1")
+	assert.NoError(t, err)
+}
+
+func TestCronJobLabelListOption(t *testing.T) {
+	cronJob := `
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: cronjob1
+  labels:
+    app: cronjob1
+spec:
+  schedule: "* * * * *"
+  jobTemplate:
+    metadata:
+      labels:
+        app: cronJob1
+    spec:
+      template:
+        spec:
+          containers:
+          - name: cronjob
+            image: busybox
+            command: ["/bin/sh","-c","date"]
+          restartPolicy: Never 
+`
+
+	// convert yaml to unstructured
+	obj := unstructured.Unstructured{}
+	dec := yaml.NewDecodingSerializer(unstructured.UnstructuredJSONScheme)
+	_, _, err := dec.Decode([]byte(cronJob), nil, &obj)
+	assert.NoError(t, err)
+	l, err := cronJobLabelListOption(obj)
+	assert.NoError(t, err)
+	assert.Equal(t, "app=cronJob1", l.LabelSelector.String())
+}
+
 func TestServiceStatus(t *testing.T) {
 	lbHealthSvc := v1.Service{Spec: v1.ServiceSpec{Type: v1.ServiceTypeLoadBalancer}, Status: v1.ServiceStatus{
 		LoadBalancer: v1.LoadBalancerStatus{
@@ -331,8 +419,7 @@ func TestReplicaSetStatus(t *testing.T) {
 			res:   types.HealthStatus{Status: types.HealthStatusProgressing, Message: "Waiting for rollout to finish: observed replica set generation less then desired generation"},
 		},
 	}
-	for d, s := range testCases {
-		fmt.Println(d)
+	for _, s := range testCases {
 		rs := s.input.DeepCopy()
 		u, err := runtime.DefaultUnstructuredConverter.ToUnstructured(&rs)
 		assert.NoError(t, err)
@@ -384,7 +471,7 @@ func TestHelmResourceStatus(t *testing.T) {
 	for _, s := range testCases {
 		obj, err := runtime.DefaultUnstructuredConverter.ToUnstructured(s.hr.DeepCopy())
 		assert.NoError(t, err)
-		res, err := checkResourceStatus(unstructured.Unstructured{Object: obj})
+		res, err := CheckResourceStatus(unstructured.Unstructured{Object: obj})
 		assert.NoError(t, err)
 		assert.Equal(t, res, s.res)
 	}
@@ -431,7 +518,7 @@ func TestHelmRepoResourceStatus(t *testing.T) {
 	for _, s := range testCases {
 		obj, err := runtime.DefaultUnstructuredConverter.ToUnstructured(s.hr.DeepCopy())
 		assert.NoError(t, err)
-		res, err := checkResourceStatus(unstructured.Unstructured{Object: obj})
+		res, err := CheckResourceStatus(unstructured.Unstructured{Object: obj})
 		assert.NoError(t, err)
 		assert.Equal(t, res, s.res)
 	}
@@ -446,7 +533,7 @@ func TestGenListOption(t *testing.T) {
 	du, err := runtime.DefaultUnstructuredConverter.ToUnstructured(&deploy)
 	assert.NoError(t, err)
 	assert.NotNil(t, du)
-	dls, err := deploy2RsLabelListOption(unstructured.Unstructured{Object: du})
+	dls, err := defaultWorkloadLabelListOption(unstructured.Unstructured{Object: du})
 	assert.NoError(t, err)
 	assert.Equal(t, listOption, dls)
 
@@ -454,7 +541,7 @@ func TestGenListOption(t *testing.T) {
 	rsu, err := runtime.DefaultUnstructuredConverter.ToUnstructured(&rs)
 	assert.NoError(t, err)
 	assert.NotNil(t, du)
-	rsls, err := rs2PodLabelListOption(unstructured.Unstructured{Object: rsu})
+	rsls, err := defaultWorkloadLabelListOption(unstructured.Unstructured{Object: rsu})
 	assert.NoError(t, err)
 	assert.Equal(t, listOption, rsls)
 
@@ -462,7 +549,7 @@ func TestGenListOption(t *testing.T) {
 	stsu, err := runtime.DefaultUnstructuredConverter.ToUnstructured(&sts)
 	assert.NoError(t, err)
 	assert.NotNil(t, stsu)
-	stsls, err := statefulSet2PodListOption(unstructured.Unstructured{Object: stsu})
+	stsls, err := defaultWorkloadLabelListOption(unstructured.Unstructured{Object: stsu})
 	assert.NoError(t, err)
 	assert.Equal(t, listOption, stsls)
 
@@ -852,9 +939,82 @@ func TestPodAdditionalInfo(t *testing.T) {
 		"pod15": case15,
 	}
 
-	for des, t2 := range testCases {
-		fmt.Println(des)
+	for _, t2 := range testCases {
 		u, err := runtime.DefaultUnstructuredConverter.ToUnstructured(t2.pod.DeepCopy())
+		assert.NoError(t, err)
+		res, err := additionalInfo(unstructured.Unstructured{Object: u})
+		assert.NoError(t, err)
+		assert.Equal(t, t2.res, res)
+	}
+}
+
+func TestDeploymentAdditionalInfo(t *testing.T) {
+	typeMeta := metav1.TypeMeta{APIVersion: "apps/v1", Kind: "Deployment"}
+
+	type testCase struct {
+		Deployment v12.Deployment
+		res        map[string]interface{}
+	}
+
+	case1 := testCase{
+		Deployment: v12.Deployment{
+			TypeMeta: typeMeta,
+			Spec:     v12.DeploymentSpec{Replicas: pointer.Int32(1)},
+			Status: v12.DeploymentStatus{
+				ReadyReplicas:     1,
+				UpdatedReplicas:   1,
+				AvailableReplicas: 1,
+			},
+		},
+		res: map[string]interface{}{
+			"Ready":     "1/1",
+			"Update":    int32(1),
+			"Available": int32(1),
+			"Age":       "<unknown>",
+		},
+	}
+
+	testCases := map[string]testCase{
+		"deployment1": case1,
+	}
+
+	for _, t2 := range testCases {
+		u, err := runtime.DefaultUnstructuredConverter.ToUnstructured(t2.Deployment.DeepCopy())
+		assert.NoError(t, err)
+		res, err := additionalInfo(unstructured.Unstructured{Object: u})
+		assert.NoError(t, err)
+		assert.Equal(t, t2.res, res)
+	}
+}
+
+func TestStatefulSetAdditionalInfo(t *testing.T) {
+	typeMeta := metav1.TypeMeta{APIVersion: "apps/v1", Kind: "StatefulSet"}
+
+	type testCase struct {
+		StatefulSet v12.StatefulSet
+		res         map[string]interface{}
+	}
+
+	case1 := testCase{
+		StatefulSet: v12.StatefulSet{
+			TypeMeta: typeMeta,
+			Spec:     v12.StatefulSetSpec{Replicas: pointer.Int32(1)},
+			Status: v12.StatefulSetStatus{
+				ReadyReplicas: 1,
+			},
+		},
+		res: map[string]interface{}{
+			"Ready": "1/1",
+			"Age":   "<unknown>",
+		},
+	}
+
+	testCases := map[string]testCase{
+		"statefulSet1": case1,
+	}
+
+	for _, t2 := range testCases {
+		u, err := runtime.DefaultUnstructuredConverter.ToUnstructured(t2.StatefulSet.DeepCopy())
 		assert.NoError(t, err)
 		res, err := additionalInfo(unstructured.Unstructured{Object: u})
 		assert.NoError(t, err)
@@ -895,8 +1055,7 @@ func TestSvcAdditionalInfo(t *testing.T) {
 		"svc2": case2,
 	}
 
-	for des, t2 := range testCases {
-		fmt.Println(des)
+	for _, t2 := range testCases {
 		u, err := runtime.DefaultUnstructuredConverter.ToUnstructured(t2.svc.DeepCopy())
 		assert.NoError(t, err)
 		res, err := additionalInfo(unstructured.Unstructured{Object: u})
@@ -1215,9 +1374,133 @@ var _ = Describe("unit-test to e2e test", func() {
 			},
 		},
 	}
+	pod5 := v1.Pod{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "v1",
+			Kind:       "Pod",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pod5",
+			Namespace: "test-namespace",
+			Labels: map[string]string{
+				"job-name": "job2",
+			},
+		},
+		Spec: v1.PodSpec{
+			Containers: []v1.Container{
+				{
+					Image: "nginx",
+					Name:  "nginx",
+				},
+			},
+		},
+	}
+
+	job1 := batchv1.Job{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "batch/v1",
+			Kind:       "Job",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "job1",
+			Namespace: "test-namespace",
+			Labels: map[string]string{
+				"app": "cronJob1",
+			},
+		},
+		Spec: batchv1.JobSpec{
+			Template: v1.PodTemplateSpec{
+				Spec: v1.PodSpec{
+					RestartPolicy: "OnFailure",
+					Containers: []v1.Container{
+						{
+							Image: "nginx",
+							Name:  "nginx",
+						},
+					},
+				},
+			},
+		},
+	}
+
+	manualSelector := true
+	job2 := batchv1.Job{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "batch/v1",
+			Kind:       "Job",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "job2",
+			Namespace: "test-namespace",
+			Labels: map[string]string{
+				"job-name": "job2",
+			},
+		},
+		Spec: batchv1.JobSpec{
+			ManualSelector: &manualSelector,
+			Selector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					"job-name": "job2",
+				},
+			},
+			Template: v1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{
+						"job-name": "job2",
+					},
+				},
+				Spec: v1.PodSpec{
+					RestartPolicy: "OnFailure",
+					Containers: []v1.Container{
+						{
+							Image: "nginx",
+							Name:  "nginx",
+						},
+					},
+				},
+			},
+		},
+	}
+
+	cronJob1 := batchv1.CronJob{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "batch/v1",
+			Kind:       "CronJob",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "cronjob1",
+			Namespace: "test-namespace",
+			Labels: map[string]string{
+				"app": "cronJob1",
+			},
+		},
+		Spec: batchv1.CronJobSpec{
+			Schedule: "* * * * *",
+			JobTemplate: batchv1.JobTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{
+						"app": "cronJob1",
+					},
+				},
+				Spec: batchv1.JobSpec{
+					Template: v1.PodTemplateSpec{
+						Spec: v1.PodSpec{
+							RestartPolicy: "OnFailure",
+							Containers: []v1.Container{
+								{
+									Image: "nginx",
+									Name:  "nginx",
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
 
 	var objectList []client.Object
-	objectList = append(objectList, &deploy1, &deploy1, &rs1, &rs2, &rs3, &rs4, &pod1, &pod2, &pod3, &rs4, &pod4)
+	objectList = append(objectList, &deploy1, &deploy1, &rs1, &rs2, &rs3, &rs4, &pod1, &pod2, &pod3, &rs4, &pod4, &pod5, &job1, &job2, &cronJob1)
 	BeforeEach(func() {
 		Expect(k8sClient.Create(ctx, &v1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "test-namespace"}})).Should(SatisfyAny(BeNil(), util.AlreadyExistMatcher{}))
 		Expect(k8sClient.Create(ctx, deploy1.DeepCopy())).Should(SatisfyAny(BeNil(), util.AlreadyExistMatcher{}))
@@ -1228,7 +1511,6 @@ var _ = Describe("unit-test to e2e test", func() {
 		Expect(k8sClient.Create(ctx, pod1.DeepCopy())).Should(SatisfyAny(BeNil(), util.AlreadyExistMatcher{}))
 		Expect(k8sClient.Create(ctx, pod2.DeepCopy())).Should(SatisfyAny(BeNil(), util.AlreadyExistMatcher{}))
 		Expect(k8sClient.Create(ctx, pod3.DeepCopy())).Should(SatisfyAny(BeNil(), util.AlreadyExistMatcher{}))
-
 		cRs4 := rs4.DeepCopy()
 		Expect(k8sClient.Create(ctx, cRs4)).Should(SatisfyAny(BeNil(), util.AlreadyExistMatcher{}))
 		cPod4 := pod4.DeepCopy()
@@ -1241,6 +1523,14 @@ var _ = Describe("unit-test to e2e test", func() {
 			},
 		})
 		Expect(k8sClient.Create(ctx, cPod4)).Should(SatisfyAny(BeNil(), util.AlreadyExistMatcher{}))
+		cCronJob1 := cronJob1.DeepCopy()
+		Expect(k8sClient.Create(ctx, cCronJob1)).Should(SatisfyAny(BeNil(), util.AlreadyExistMatcher{}))
+		cJob1 := job1.DeepCopy()
+		Expect(k8sClient.Create(ctx, cJob1)).Should(SatisfyAny(BeNil(), util.AlreadyExistMatcher{}))
+		cJob2 := job2.DeepCopy()
+		Expect(k8sClient.Create(ctx, cJob2)).Should(SatisfyAny(BeNil(), util.AlreadyExistMatcher{}))
+		cPod5 := pod5.DeepCopy()
+		Expect(k8sClient.Create(ctx, cPod5)).Should(SatisfyAny(BeNil(), util.AlreadyExistMatcher{}))
 	})
 
 	AfterEach(func() {
@@ -1266,14 +1556,14 @@ var _ = Describe("unit-test to e2e test", func() {
 		u, err := runtime.DefaultUnstructuredConverter.ToUnstructured(deploy1.DeepCopy())
 		Expect(err).Should(BeNil())
 		items, err := listItemByRule(ctx, k8sClient, ResourceType{APIVersion: "apps/v1", Kind: "ReplicaSet"}, unstructured.Unstructured{Object: u},
-			deploy2RsLabelListOption, nil)
+			defaultWorkloadLabelListOption, nil, true)
 		Expect(err).Should(BeNil())
 		Expect(len(items)).Should(BeEquivalentTo(2))
 
 		u2, err := runtime.DefaultUnstructuredConverter.ToUnstructured(deploy2.DeepCopy())
 		Expect(err).Should(BeNil())
 		items2, err := listItemByRule(ctx, k8sClient, ResourceType{APIVersion: "apps/v1", Kind: "ReplicaSet"}, unstructured.Unstructured{Object: u2},
-			nil, deploy2RsLabelListOption)
+			nil, defaultWorkloadLabelListOption, true)
 		Expect(len(items2)).Should(BeEquivalentTo(1))
 
 		// test use ownerReference UId to filter
@@ -1285,23 +1575,61 @@ var _ = Describe("unit-test to e2e test", func() {
 		Expect(k8sClient.Get(ctx, types2.NamespacedName{Namespace: u3.GetNamespace(), Name: u3.GetName()}, &u3))
 		Expect(err).Should(BeNil())
 		items3, err := listItemByRule(ctx, k8sClient, ResourceType{APIVersion: "v1", Kind: "Pod"}, u3,
-			nil, nil)
+			nil, nil, true)
 		Expect(err).Should(BeNil())
 		Expect(len(items3)).Should(BeEquivalentTo(1))
+
+		u4 := unstructured.Unstructured{}
+		u4.SetNamespace(cronJob1.Namespace)
+		u4.SetName(cronJob1.Name)
+		u4.SetAPIVersion("batch/v1")
+		u4.SetKind("CronJob")
+		Expect(k8sClient.Get(ctx, types2.NamespacedName{Namespace: u4.GetNamespace(), Name: u4.GetName()}, &u4))
+		Expect(err).Should(BeNil())
+		item4, err := listItemByRule(ctx, k8sClient, ResourceType{APIVersion: "batch/v1", Kind: "Job"}, u4,
+			cronJobLabelListOption, nil, true)
+		Expect(err).Should(BeNil())
+		Expect(len(item4)).Should(BeEquivalentTo(1))
 	})
 
 	It("iterate resource", func() {
-		tn, err := iteratorChildResources(ctx, "", k8sClient, types.ResourceTreeNode{
+		tn, err := iterateListSubResources(ctx, "", k8sClient, types.ResourceTreeNode{
 			Cluster:    "",
 			Namespace:  "test-namespace",
 			Name:       "deploy1",
 			APIVersion: "apps/v1",
 			Kind:       "Deployment",
-		}, 1)
+		}, 1, func(node types.ResourceTreeNode) bool {
+			return true
+		})
 		Expect(err).Should(BeNil())
 		Expect(len(tn)).Should(BeEquivalentTo(2))
 		Expect(len(tn[0].LeafNodes)).Should(BeEquivalentTo(1))
 		Expect(len(tn[1].LeafNodes)).Should(BeEquivalentTo(1))
+
+		tn, err = iterateListSubResources(ctx, "", k8sClient, types.ResourceTreeNode{
+			Cluster:    "",
+			Namespace:  "test-namespace",
+			Name:       "cronjob1",
+			APIVersion: "batch/v1",
+			Kind:       "CronJob",
+		}, 1, func(node types.ResourceTreeNode) bool {
+			return true
+		})
+		Expect(err).Should(BeNil())
+		Expect(len(tn)).Should(BeEquivalentTo(1))
+
+		tn, err = iterateListSubResources(ctx, "", k8sClient, types.ResourceTreeNode{
+			Cluster:    "",
+			Namespace:  "test-namespace",
+			Name:       "job2",
+			APIVersion: "batch/v1",
+			Kind:       "Job",
+		}, 1, func(node types.ResourceTreeNode) bool {
+			return true
+		})
+		Expect(err).Should(BeNil())
+		Expect(len(tn)).Should(BeEquivalentTo(1))
 	})
 
 	It("test provider handler func", func() {
@@ -1368,10 +1696,12 @@ var _ = Describe("unit-test to e2e test", func() {
 		opt := `app: {
 				name: "app"
 				namespace: "test-namespace"
+				withTree: true
 			}`
 		v, err := value.NewValue(opt, nil, "")
 		Expect(err).Should(BeNil())
-		Expect(prd.GetApplicationResourceTree(nil, v, nil)).Should(BeNil())
+		logCtx := monitorContext.NewTraceContext(ctx, "")
+		Expect(prd.ListAppliedResources(logCtx, nil, v, nil)).Should(BeNil())
 		type Res struct {
 			List []types.AppliedResource `json:"list"`
 		}
@@ -1405,21 +1735,29 @@ var _ = Describe("unit-test to e2e test", func() {
 		}
 		Expect(k8sClient.Create(ctx, &badRuleConfigMap)).Should(BeNil())
 
+		// clear after test
+		objectList = append(objectList, &badRuleConfigMap)
+
 		notExistParentConfigMap := v1.ConfigMap{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMap"},
 			ObjectMeta: metav1.ObjectMeta{Namespace: types3.DefaultKubeVelaNS, Name: "not-exist-parent", Labels: map[string]string{oam.LabelResourceRules: "true"}},
 			Data:       map[string]string{relationshipKey: notExistParentResourceStr},
 		}
 		Expect(k8sClient.Create(ctx, &notExistParentConfigMap)).Should(BeNil())
 
+		// clear after test
+		objectList = append(objectList, &badRuleConfigMap)
+
 		prd := provider{cli: k8sClient}
 		opt := `app: {
 				name: "app"
 				namespace: "test-namespace"
+				withTree: true
 			}`
 		v, err := value.NewValue(opt, nil, "")
 
 		Expect(err).Should(BeNil())
-		Expect(prd.GetApplicationResourceTree(nil, v, nil)).Should(BeNil())
+		logCtx := monitorContext.NewTraceContext(ctx, "")
+		Expect(prd.ListAppliedResources(logCtx, nil, v, nil)).Should(BeNil())
 		type Res struct {
 			List []types.AppliedResource `json:"list"`
 		}
@@ -1438,16 +1776,35 @@ var _ = Describe("test merge globalRules", func() {
   childrenResourceType:
     - apiVersion: v1
       kind: Pod
+      defaultLabelSelector: true
     - apiVersion: apps/v1
       kind: ControllerRevision
+`
+	clickhouseJsonStr := `
+[
+  {
+    "parentResourceType": {
+      "group": "clickhouse.altinity.com",
+      "kind": "ClickHouseInstallation"
+    },
+    "childrenResourceType": [
+      {
+        "apiVersion": "apps/v1",
+        "kind": "StatefulSet"
+      },
+      {
+        "apiVersion": "v1",
+        "kind": "Service"
+      }
+    ]
+  }
+]
 `
 	daemonSetStr := `
 - parentResourceType:
     group: apps
     kind: DaemonSet
   childrenResourceType:
-    - apiVersion: v1
-      kind: Pod
     - apiVersion: apps/v1
       kind: ControllerRevision
 `
@@ -1475,20 +1832,29 @@ childrenResourceType:
 	It("test merge rules", func() {
 		Expect(k8sClient.Create(ctx, &v1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "vela-system"}})).Should(SatisfyAny(BeNil(), util.AlreadyExistMatcher{}))
 		cloneSetConfigMap := v1.ConfigMap{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMap"},
-			ObjectMeta: metav1.ObjectMeta{Namespace: types3.DefaultKubeVelaNS, Name: "cloneset", Labels: map[string]string{oam.LabelResourceRules: "true"}},
-			Data:       map[string]string{relationshipKey: cloneSetStr},
+			ObjectMeta: metav1.ObjectMeta{Namespace: types3.DefaultKubeVelaNS, Name: "cloneset", Labels: map[string]string{
+				oam.LabelResourceRules:      "true",
+				oam.LabelResourceRuleFormat: oam.ResourceTopologyFormatYAML,
+			}},
+			Data: map[string]string{relationshipKey: cloneSetStr},
 		}
 		Expect(k8sClient.Create(ctx, &cloneSetConfigMap)).Should(BeNil())
 
 		daemonSetConfigMap := v1.ConfigMap{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMap"},
-			ObjectMeta: metav1.ObjectMeta{Namespace: types3.DefaultKubeVelaNS, Name: "daemonset", Labels: map[string]string{oam.LabelResourceRules: "true"}},
-			Data:       map[string]string{relationshipKey: daemonSetStr},
+			ObjectMeta: metav1.ObjectMeta{Namespace: types3.DefaultKubeVelaNS, Name: "daemonset", Labels: map[string]string{
+				oam.LabelResourceRules:      "true",
+				oam.LabelResourceRuleFormat: oam.ResourceTopologyFormatYAML,
+			}},
+			Data: map[string]string{relationshipKey: daemonSetStr},
 		}
 		Expect(k8sClient.Create(ctx, &daemonSetConfigMap)).Should(BeNil())
 
 		stsConfigMap := v1.ConfigMap{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMap"},
-			ObjectMeta: metav1.ObjectMeta{Namespace: types3.DefaultKubeVelaNS, Name: "sts", Labels: map[string]string{oam.LabelResourceRules: "true"}},
-			Data:       map[string]string{relationshipKey: stsStr},
+			ObjectMeta: metav1.ObjectMeta{Namespace: types3.DefaultKubeVelaNS, Name: "sts", Labels: map[string]string{
+				oam.LabelResourceRules:      "true",
+				oam.LabelResourceRuleFormat: oam.ResourceTopologyFormatYAML,
+			}},
+			Data: map[string]string{relationshipKey: stsStr},
 		}
 		Expect(k8sClient.Create(ctx, &stsConfigMap)).Should(BeNil())
 
@@ -1498,32 +1864,67 @@ childrenResourceType:
 		}
 		Expect(k8sClient.Create(ctx, &missConfigedCm)).Should(BeNil())
 
+		clickhouseJsonCm := v1.ConfigMap{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMap"},
+			ObjectMeta: metav1.ObjectMeta{Namespace: types3.DefaultKubeVelaNS, Name: "clickhouse", Labels: map[string]string{
+				oam.LabelResourceRules:      "true",
+				oam.LabelResourceRuleFormat: oam.ResourceTopologyFormatJSON,
+			}},
+			Data: map[string]string{relationshipKey: clickhouseJsonStr},
+		}
+		Expect(k8sClient.Create(ctx, &clickhouseJsonCm)).Should(BeNil())
+
 		Expect(mergeCustomRules(ctx, k8sClient)).Should(BeNil())
-		childrenResources, ok := globalRule[GroupResourceType{Group: "apps.kruise.io", Kind: "CloneSet"}]
+		childrenResources, ok := globalRule.GetRule(GroupResourceType{Group: "apps.kruise.io", Kind: "CloneSet"})
 		Expect(ok).Should(BeTrue())
 		Expect(childrenResources.DefaultGenListOptionFunc).Should(BeNil())
-		Expect(len(childrenResources.CareResource)).Should(BeEquivalentTo(2))
-		specifyFunc, ok := childrenResources.CareResource[ResourceType{APIVersion: "v1", Kind: "Pod"}]
-		Expect(ok).Should(BeTrue())
-		Expect(specifyFunc).Should(BeNil())
+		Expect(len(*childrenResources.SubResources)).Should(BeEquivalentTo(2))
 
-		dsChildrenResources, ok := globalRule[GroupResourceType{Group: "apps", Kind: "DaemonSet"}]
+		crPod := childrenResources.SubResources.Get(ResourceType{APIVersion: "v1", Kind: "Pod"})
+		Expect(crPod).ShouldNot(BeNil())
+		Expect(crPod.listOptions).ShouldNot(BeNil())
+
+		dsChildrenResources, ok := globalRule.GetRule(GroupResourceType{Group: "apps", Kind: "DaemonSet"})
 		Expect(ok).Should(BeTrue())
 		Expect(dsChildrenResources.DefaultGenListOptionFunc).Should(BeNil())
-		Expect(len(dsChildrenResources.CareResource)).Should(BeEquivalentTo(2))
-		dsSpecifyFunc, ok := dsChildrenResources.CareResource[ResourceType{APIVersion: "v1", Kind: "Pod"}]
-		Expect(ok).Should(BeTrue())
-		Expect(dsSpecifyFunc).Should(BeNil())
-		crSpecifyFunc, ok := dsChildrenResources.CareResource[ResourceType{APIVersion: "apps/v1", Kind: "ControllerRevision"}]
-		Expect(ok).Should(BeTrue())
-		Expect(crSpecifyFunc).Should(BeNil())
+		Expect(len(*dsChildrenResources.SubResources)).Should(BeEquivalentTo(2))
 
-		stsChildrenResources, ok := globalRule[GroupResourceType{Group: "apps", Kind: "StatefulSet"}]
+		// with the error version
+		crPod2 := dsChildrenResources.SubResources.Get(ResourceType{APIVersion: "v1", Kind: "ControllerRevision"})
+		Expect(crPod2).Should(BeNil())
+
+		crPod3 := dsChildrenResources.SubResources.Get(ResourceType{APIVersion: "v1", Kind: "Pod"})
+		Expect(crPod3).ShouldNot(BeNil())
+		Expect(crPod3.listOptions).ShouldNot(BeNil())
+
+		cr := dsChildrenResources.SubResources.Get(ResourceType{APIVersion: "apps/v1", Kind: "ControllerRevision"})
+		Expect(cr).ShouldNot(BeNil())
+		Expect(cr.listOptions).Should(BeNil())
+
+		stsChildrenResources, ok := globalRule.GetRule(GroupResourceType{Group: "apps", Kind: "StatefulSet"})
 		Expect(ok).Should(BeTrue())
 		Expect(stsChildrenResources.DefaultGenListOptionFunc).Should(BeNil())
-		Expect(len(stsChildrenResources.CareResource)).Should(BeEquivalentTo(2))
-		stsCrSpecifyFunc, ok := stsChildrenResources.CareResource[ResourceType{APIVersion: "apps/v1", Kind: "ControllerRevision"}]
+		Expect(len(*stsChildrenResources.SubResources)).Should(BeEquivalentTo(2))
+		revisionCR := stsChildrenResources.SubResources.Get(ResourceType{APIVersion: "apps/v1", Kind: "ControllerRevision"})
+		Expect(revisionCR).ShouldNot(BeNil())
+		Expect(revisionCR.listOptions).Should(BeNil())
+
+		chChildrenResources, ok := globalRule.GetRule(GroupResourceType{Group: "clickhouse.altinity.com", Kind: "ClickHouseInstallation"})
 		Expect(ok).Should(BeTrue())
-		Expect(stsCrSpecifyFunc).Should(BeNil())
+		Expect(chChildrenResources.DefaultGenListOptionFunc).Should(BeNil())
+		Expect(len(*chChildrenResources.SubResources)).Should(BeEquivalentTo(2))
+
+		chSts := chChildrenResources.SubResources.Get(ResourceType{APIVersion: "apps/v1", Kind: "StatefulSet"})
+		Expect(chSts).ShouldNot(BeNil())
+		Expect(chSts.listOptions).Should(BeNil())
+
+		chSvc := chChildrenResources.SubResources.Get(ResourceType{APIVersion: "v1", Kind: "Service"})
+		Expect(chSvc).ShouldNot(BeNil())
+		Expect(chSvc.listOptions).Should(BeNil())
+
+		// clear data
+		Expect(k8sClient.Delete(context.TODO(), &missConfigedCm)).Should(BeNil())
+		Expect(k8sClient.Delete(context.TODO(), &stsConfigMap)).Should(BeNil())
+		Expect(k8sClient.Delete(context.TODO(), &daemonSetConfigMap)).Should(BeNil())
+		Expect(k8sClient.Delete(context.TODO(), &cloneSetConfigMap)).Should(BeNil())
 	})
 })

@@ -20,21 +20,22 @@ import (
 	"context"
 	"encoding/json"
 	"strings"
-	"sync"
 
+	"cuelang.org/go/cue/cuecontext"
 	"github.com/pkg/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	monitorContext "github.com/kubevela/pkg/monitor/context"
+	wfContext "github.com/kubevela/workflow/pkg/context"
+	"github.com/kubevela/workflow/pkg/cue/model/sets"
+	"github.com/kubevela/workflow/pkg/cue/model/value"
+	wfTypes "github.com/kubevela/workflow/pkg/types"
+
 	"github.com/oam-dev/kubevela/apis/core.oam.dev/common"
 	"github.com/oam-dev/kubevela/apis/core.oam.dev/v1beta1"
 	"github.com/oam-dev/kubevela/pkg/appfile"
-	"github.com/oam-dev/kubevela/pkg/cue/model/sets"
-	"github.com/oam-dev/kubevela/pkg/cue/model/value"
 	"github.com/oam-dev/kubevela/pkg/oam"
-	wfContext "github.com/oam-dev/kubevela/pkg/workflow/context"
-	"github.com/oam-dev/kubevela/pkg/workflow/providers"
-	wfTypes "github.com/oam-dev/kubevela/pkg/workflow/types"
 )
 
 const (
@@ -43,16 +44,16 @@ const (
 )
 
 // ComponentApply apply oam component.
-type ComponentApply func(comp common.ApplicationComponent, patcher *value.Value, clusterName string, overrideNamespace string, env string) (*unstructured.Unstructured, []*unstructured.Unstructured, bool, error)
+type ComponentApply func(ctx context.Context, comp common.ApplicationComponent, patcher *value.Value, clusterName string, overrideNamespace string, env string) (*unstructured.Unstructured, []*unstructured.Unstructured, bool, error)
 
 // ComponentRender render oam component.
-type ComponentRender func(comp common.ApplicationComponent, patcher *value.Value, clusterName string, overrideNamespace string, env string) (*unstructured.Unstructured, []*unstructured.Unstructured, error)
+type ComponentRender func(ctx context.Context, comp common.ApplicationComponent, patcher *value.Value, clusterName string, overrideNamespace string, env string) (*unstructured.Unstructured, []*unstructured.Unstructured, error)
 
 // ComponentHealthCheck health check oam component.
-type ComponentHealthCheck func(comp common.ApplicationComponent, patcher *value.Value, clusterName string, overrideNamespace string, env string) (bool, error)
+type ComponentHealthCheck func(ctx context.Context, comp common.ApplicationComponent, patcher *value.Value, clusterName string, overrideNamespace string, env string) (bool, *unstructured.Unstructured, []*unstructured.Unstructured, error)
 
 // WorkloadRenderer renderer to render application component into workload
-type WorkloadRenderer func(comp common.ApplicationComponent) (*appfile.Workload, error)
+type WorkloadRenderer func(ctx context.Context, comp common.ApplicationComponent) (*appfile.Workload, error)
 
 type provider struct {
 	render ComponentRender
@@ -63,12 +64,12 @@ type provider struct {
 }
 
 // RenderComponent render component
-func (p *provider) RenderComponent(ctx wfContext.Context, v *value.Value, act wfTypes.Action) error {
-	comp, patcher, clusterName, overrideNamespace, env, err := lookUpValues(v, nil)
+func (p *provider) RenderComponent(ctx monitorContext.Context, wfCtx wfContext.Context, v *value.Value, act wfTypes.Action) error {
+	comp, patcher, clusterName, overrideNamespace, env, err := lookUpCompInfo(v)
 	if err != nil {
 		return err
 	}
-	workload, traits, err := p.render(*comp, patcher, clusterName, overrideNamespace, env)
+	workload, traits, err := p.render(ctx, *comp, patcher, clusterName, overrideNamespace, env)
 	if err != nil {
 		return err
 	}
@@ -91,19 +92,15 @@ func (p *provider) RenderComponent(ctx wfContext.Context, v *value.Value, act wf
 	return nil
 }
 
-func (p *provider) applyComponent(_ wfContext.Context, v *value.Value, act wfTypes.Action, mu *sync.Mutex) error {
-	comp, patcher, clusterName, overrideNamespace, env, err := lookUpValues(v, mu)
+// ApplyComponent apply component.
+func (p *provider) ApplyComponent(ctx monitorContext.Context, wfCtx wfContext.Context, v *value.Value, act wfTypes.Action) error {
+	comp, patcher, clusterName, overrideNamespace, env, err := lookUpCompInfo(v)
 	if err != nil {
 		return err
 	}
-	workload, traits, healthy, err := p.apply(*comp, patcher, clusterName, overrideNamespace, env)
+	workload, traits, healthy, err := p.apply(ctx, *comp, patcher, clusterName, overrideNamespace, env)
 	if err != nil {
 		return err
-	}
-
-	if mu != nil {
-		mu.Lock()
-		defer mu.Unlock()
 	}
 
 	if workload != nil {
@@ -129,20 +126,10 @@ func (p *provider) applyComponent(_ wfContext.Context, v *value.Value, act wfTyp
 	if waitHealthy && !healthy {
 		act.Wait("wait healthy")
 	}
-
 	return nil
 }
 
-// ApplyComponent apply component.
-func (p *provider) ApplyComponent(ctx wfContext.Context, v *value.Value, act wfTypes.Action) error {
-	return p.applyComponent(ctx, v, act, nil)
-}
-
-func lookUpValues(v *value.Value, mu *sync.Mutex) (*common.ApplicationComponent, *value.Value, string, string, string, error) {
-	if mu != nil {
-		mu.Lock()
-		defer mu.Unlock()
-	}
+func lookUpCompInfo(v *value.Value) (*common.ApplicationComponent, *value.Value, string, string, string, error) {
 	compSettings, err := v.LookupValue("value")
 	if err != nil {
 		return nil, nil, "", "", "", err
@@ -172,7 +159,7 @@ func lookUpValues(v *value.Value, mu *sync.Mutex) (*common.ApplicationComponent,
 }
 
 // LoadComponent load component describe info in application.
-func (p *provider) LoadComponent(ctx wfContext.Context, v *value.Value, act wfTypes.Action) error {
+func (p *provider) LoadComponent(ctx monitorContext.Context, wfCtx wfContext.Context, v *value.Value, act wfTypes.Action) error {
 	app := &v1beta1.Application{}
 	// if specify `app`, use specified application otherwise use default application from provider
 	appSettings, err := v.LookupValue("app")
@@ -188,7 +175,7 @@ func (p *provider) LoadComponent(ctx wfContext.Context, v *value.Value, act wfTy
 		}
 	}
 	for _, _comp := range app.Spec.Components {
-		comp, err := p.af.LoadDynamicComponent(context.Background(), p.cli, _comp.DeepCopy())
+		comp, err := p.af.LoadDynamicComponent(ctx, p.cli, _comp.DeepCopy())
 		if err != nil {
 			return err
 		}
@@ -199,8 +186,15 @@ func (p *provider) LoadComponent(ctx wfContext.Context, v *value.Value, act wfTy
 			return err
 		}
 		vs := string(jt)
-		if s, err := sets.OpenBaiscLit(vs); err == nil {
-			vs = s
+		cuectx := cuecontext.New()
+		val := cuectx.CompileString(vs)
+		if s, err := sets.OpenBaiscLit(val); err == nil {
+			v := cuectx.BuildFile(s)
+			str, err := sets.ToString(v)
+			if err != nil {
+				return err
+			}
+			vs = str
 		}
 		if err := v.FillRaw(vs, "value", comp.Name); err != nil {
 			return err
@@ -210,7 +204,7 @@ func (p *provider) LoadComponent(ctx wfContext.Context, v *value.Value, act wfTy
 }
 
 // LoadComponentInOrder load component describe info in application output will be a list with order defined in application.
-func (p *provider) LoadComponentInOrder(ctx wfContext.Context, v *value.Value, act wfTypes.Action) error {
+func (p *provider) LoadComponentInOrder(ctx monitorContext.Context, wfCtx wfContext.Context, v *value.Value, act wfTypes.Action) error {
 	app := &v1beta1.Application{}
 	// if specify `app`, use specified application otherwise use default application from provider
 	appSettings, err := v.LookupValue("app")
@@ -227,7 +221,7 @@ func (p *provider) LoadComponentInOrder(ctx wfContext.Context, v *value.Value, a
 	}
 	comps := make([]common.ApplicationComponent, len(app.Spec.Components))
 	for idx, _comp := range app.Spec.Components {
-		comp, err := p.af.LoadDynamicComponent(context.Background(), p.cli, _comp.DeepCopy())
+		comp, err := p.af.LoadDynamicComponent(ctx, p.cli, _comp.DeepCopy())
 		if err != nil {
 			return err
 		}
@@ -242,7 +236,7 @@ func (p *provider) LoadComponentInOrder(ctx wfContext.Context, v *value.Value, a
 }
 
 // LoadPolicies load policy describe info in application.
-func (p *provider) LoadPolicies(ctx wfContext.Context, v *value.Value, act wfTypes.Action) error {
+func (p *provider) LoadPolicies(ctx monitorContext.Context, wfCtx wfContext.Context, v *value.Value, act wfTypes.Action) error {
 	for _, po := range p.app.Spec.Policies {
 		if err := v.FillObject(po, "value", po.Name); err != nil {
 			return err
@@ -252,7 +246,7 @@ func (p *provider) LoadPolicies(ctx wfContext.Context, v *value.Value, act wfTyp
 }
 
 // Install register handlers to provider discover.
-func Install(p providers.Providers, app *v1beta1.Application, af *appfile.Appfile, cli client.Client, apply ComponentApply, render ComponentRender) {
+func Install(p wfTypes.Providers, app *v1beta1.Application, af *appfile.Appfile, cli client.Client, apply ComponentApply, render ComponentRender) {
 	prd := &provider{
 		render: render,
 		apply:  apply,
@@ -260,7 +254,7 @@ func Install(p providers.Providers, app *v1beta1.Application, af *appfile.Appfil
 		af:     af,
 		cli:    cli,
 	}
-	p.Register(ProviderName, map[string]providers.Handler{
+	p.Register(ProviderName, map[string]wfTypes.Handler{
 		"component-render":    prd.RenderComponent,
 		"component-apply":     prd.ApplyComponent,
 		"load":                prd.LoadComponent,

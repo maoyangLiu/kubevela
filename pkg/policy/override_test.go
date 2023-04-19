@@ -32,7 +32,7 @@ import (
 
 func TestParseOverridePolicyRelatedDefinitions(t *testing.T) {
 	cli := fake.NewClientBuilder().WithScheme(common.Scheme).WithObjects(&v1beta1.ComponentDefinition{
-		ObjectMeta: v1.ObjectMeta{Name: "comp", Namespace: oam.SystemDefinitonNamespace},
+		ObjectMeta: v1.ObjectMeta{Name: "comp", Namespace: oam.SystemDefinitionNamespace},
 	}, &v1beta1.TraitDefinition{
 		ObjectMeta: v1.ObjectMeta{Name: "trait", Namespace: "test"},
 	}).Build()
@@ -47,7 +47,7 @@ func TestParseOverridePolicyRelatedDefinitions(t *testing.T) {
 	}{
 		"normal": {
 			Policy:        v1beta1.AppPolicy{Properties: &runtime.RawExtension{Raw: []byte(`{"components":[{"type":"comp","traits":[{"type":"trait"}]}]}`)}},
-			ComponentDefs: []*v1beta1.ComponentDefinition{{ObjectMeta: v1.ObjectMeta{Name: "comp", Namespace: oam.SystemDefinitonNamespace}}},
+			ComponentDefs: []*v1beta1.ComponentDefinition{{ObjectMeta: v1.ObjectMeta{Name: "comp", Namespace: oam.SystemDefinitionNamespace}}},
 			TraitDefs:     []*v1beta1.TraitDefinition{{ObjectMeta: v1.ObjectMeta{Name: "trait", Namespace: "test"}}},
 		},
 		"invalid-override-policy": {
@@ -61,6 +61,12 @@ func TestParseOverridePolicyRelatedDefinitions(t *testing.T) {
 		"trait-def-not-found": {
 			Policy: v1beta1.AppPolicy{Properties: &runtime.RawExtension{Raw: []byte(`{"components":[{"type":"comp","traits":[{"type":"trait-404"}]}]}`)}},
 			Error:  "failed to get trait definition",
+		},
+		"empty-policy": {
+			Policy:        v1beta1.AppPolicy{Properties: nil},
+			ComponentDefs: nil,
+			TraitDefs:     nil,
+			Error:         "have empty properties",
 		},
 	}
 	for name, tt := range testCases {

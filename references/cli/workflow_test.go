@@ -28,10 +28,12 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 
+	workflowv1alpha1 "github.com/kubevela/workflow/api/v1alpha1"
+	wfTypes "github.com/kubevela/workflow/pkg/types"
+
 	"github.com/oam-dev/kubevela/apis/core.oam.dev/common"
 	"github.com/oam-dev/kubevela/apis/core.oam.dev/v1beta1"
 	cmdutil "github.com/oam-dev/kubevela/pkg/utils/util"
-	"github.com/oam-dev/kubevela/pkg/workflow/tasks/custom"
 )
 
 var workflowSpec = v1beta1.ApplicationSpec{
@@ -41,10 +43,12 @@ var workflowSpec = v1beta1.ApplicationSpec{
 		Properties: &runtime.RawExtension{Raw: []byte(`{"cmd":["sleep","1000"],"image":"busybox"}`)},
 	}},
 	Workflow: &v1beta1.Workflow{
-		Steps: []v1beta1.WorkflowStep{{
-			Name:       "test-wf1",
-			Type:       "foowf",
-			Properties: &runtime.RawExtension{Raw: []byte(`{"namespace":"default"}`)},
+		Steps: []workflowv1alpha1.WorkflowStep{{
+			WorkflowStepBase: workflowv1alpha1.WorkflowStepBase{
+				Name:       "test-wf1",
+				Type:       "foowf",
+				Properties: &runtime.RawExtension{Raw: []byte(`{"namespace":"default"}`)},
+			},
 		}},
 	},
 }
@@ -56,10 +60,12 @@ func TestWorkflowSuspend(t *testing.T) {
 
 	testCases := map[string]struct {
 		app         *v1beta1.Application
-		expectedErr error
+		expected    *v1beta1.Application
+		step        string
+		expectedErr string
 	}{
 		"no app name specified": {
-			expectedErr: fmt.Errorf("must specify application name"),
+			expectedErr: "please specify the name of application/workflow",
 		},
 		"workflow not running": {
 			app: &v1beta1.Application{
@@ -70,7 +76,7 @@ func TestWorkflowSuspend(t *testing.T) {
 				Spec:   workflowSpec,
 				Status: common.AppStatus{},
 			},
-			expectedErr: fmt.Errorf("the workflow in application is not running"),
+			expectedErr: "the workflow in application workflow-not-running is not start",
 		},
 		"suspend successfully": {
 			app: &v1beta1.Application{
@@ -85,13 +91,345 @@ func TestWorkflowSuspend(t *testing.T) {
 					},
 				},
 			},
+			expected: &v1beta1.Application{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "workflow",
+					Namespace: "test",
+				},
+				Spec: workflowSpec,
+				Status: common.AppStatus{
+					Workflow: &common.WorkflowStatus{
+						Suspend: true,
+					},
+				},
+			},
+		},
+		"step not found": {
+			app: &v1beta1.Application{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "step-not-found",
+					Namespace: "default",
+				},
+				Spec: workflowSpec,
+				Status: common.AppStatus{
+					Workflow: &common.WorkflowStatus{
+						Suspend: false,
+					},
+				},
+			},
+			step:        "not-found",
+			expectedErr: "can not find",
+		},
+		"suspend all": {
+			app: &v1beta1.Application{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "suspend-all",
+					Namespace: "default",
+				},
+				Spec: workflowSpec,
+				Status: common.AppStatus{
+					Workflow: &common.WorkflowStatus{
+						Steps: []workflowv1alpha1.WorkflowStepStatus{
+							{
+								StepStatus: workflowv1alpha1.StepStatus{
+									Name:  "step1",
+									Phase: workflowv1alpha1.WorkflowStepPhaseRunning,
+								},
+								SubStepsStatus: []workflowv1alpha1.StepStatus{
+									{
+										Name:  "sub1",
+										Phase: workflowv1alpha1.WorkflowStepPhaseRunning,
+									},
+								},
+							},
+							{
+								StepStatus: workflowv1alpha1.StepStatus{
+									Name:  "step2",
+									Phase: workflowv1alpha1.WorkflowStepPhaseRunning,
+								},
+								SubStepsStatus: []workflowv1alpha1.StepStatus{
+									{
+										Name:  "sub2",
+										Phase: workflowv1alpha1.WorkflowStepPhaseSucceeded,
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expected: &v1beta1.Application{
+				Status: common.AppStatus{
+					Workflow: &common.WorkflowStatus{
+						Suspend: true,
+						Steps: []workflowv1alpha1.WorkflowStepStatus{
+							{
+								StepStatus: workflowv1alpha1.StepStatus{
+									Name:  "step1",
+									Phase: workflowv1alpha1.WorkflowStepPhaseSuspending,
+								},
+								SubStepsStatus: []workflowv1alpha1.StepStatus{
+									{
+										Name:  "sub1",
+										Phase: workflowv1alpha1.WorkflowStepPhaseSuspending,
+									},
+								},
+							},
+							{
+								StepStatus: workflowv1alpha1.StepStatus{
+									Name:  "step2",
+									Phase: workflowv1alpha1.WorkflowStepPhaseSuspending,
+								},
+								SubStepsStatus: []workflowv1alpha1.StepStatus{
+									{
+										Name:  "sub2",
+										Phase: workflowv1alpha1.WorkflowStepPhaseSucceeded,
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		"suspend specific step": {
+			app: &v1beta1.Application{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "suspend-step",
+					Namespace: "default",
+				},
+				Spec: workflowSpec,
+				Status: common.AppStatus{
+					Workflow: &common.WorkflowStatus{
+						Steps: []workflowv1alpha1.WorkflowStepStatus{
+							{
+								StepStatus: workflowv1alpha1.StepStatus{
+									Name:  "step1",
+									Phase: workflowv1alpha1.WorkflowStepPhaseRunning,
+								},
+								SubStepsStatus: []workflowv1alpha1.StepStatus{
+									{
+										Name:  "sub1",
+										Phase: workflowv1alpha1.WorkflowStepPhaseRunning,
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expected: &v1beta1.Application{
+				Status: common.AppStatus{
+					Workflow: &common.WorkflowStatus{
+						Suspend: true,
+						Steps: []workflowv1alpha1.WorkflowStepStatus{
+							{
+								StepStatus: workflowv1alpha1.StepStatus{
+									Name:  "step1",
+									Phase: workflowv1alpha1.WorkflowStepPhaseSuspending,
+								},
+								SubStepsStatus: []workflowv1alpha1.StepStatus{
+									{
+										Name:  "sub1",
+										Phase: workflowv1alpha1.WorkflowStepPhaseSuspending,
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			step: "step1",
+		},
+		"suspend specific sub step": {
+			app: &v1beta1.Application{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "suspend-sub-step",
+					Namespace: "default",
+				},
+				Spec: workflowSpec,
+				Status: common.AppStatus{
+					Workflow: &common.WorkflowStatus{
+						Steps: []workflowv1alpha1.WorkflowStepStatus{
+							{
+								StepStatus: workflowv1alpha1.StepStatus{
+									Name:  "step1",
+									Phase: workflowv1alpha1.WorkflowStepPhaseRunning,
+								},
+								SubStepsStatus: []workflowv1alpha1.StepStatus{
+									{
+										Name:  "sub1",
+										Phase: workflowv1alpha1.WorkflowStepPhaseRunning,
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expected: &v1beta1.Application{
+				Status: common.AppStatus{
+					Workflow: &common.WorkflowStatus{
+						Suspend: true,
+						Steps: []workflowv1alpha1.WorkflowStepStatus{
+							{
+								StepStatus: workflowv1alpha1.StepStatus{
+									Name:  "step1",
+									Phase: workflowv1alpha1.WorkflowStepPhaseRunning,
+								},
+								SubStepsStatus: []workflowv1alpha1.StepStatus{
+									{
+										Name:  "sub1",
+										Phase: workflowv1alpha1.WorkflowStepPhaseSuspending,
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			step: "sub1",
 		},
 	}
 
 	for name, tc := range testCases {
 		t.Run(name, func(t *testing.T) {
 			r := require.New(t)
-			cmd := NewWorkflowSuspendCommand(c, ioStream)
+			cmd := NewWorkflowSuspendCommand(c, ioStream, &WorkflowArgs{Args: c, Writer: ioStream.Out})
+			initCommand(cmd)
+			// clean up the arguments before start
+			cmd.SetArgs([]string{})
+			client, err := c.GetClient()
+			r.NoError(err)
+			if tc.app != nil {
+				err := client.Create(ctx, tc.app)
+				r.NoError(err)
+				cmdArgs := []string{tc.app.Name}
+				if tc.app.Namespace != corev1.NamespaceDefault {
+					err := client.Create(ctx, &corev1.Namespace{
+						ObjectMeta: metav1.ObjectMeta{
+							Name: tc.app.Namespace,
+						},
+					})
+					r.NoError(err)
+					cmdArgs = append(cmdArgs, "-n", tc.app.Namespace)
+					cmd.SetArgs([]string{tc.app.Name, "-n", tc.app.Namespace})
+				}
+				if tc.step != "" {
+					cmdArgs = append(cmdArgs, "--step", tc.step)
+				}
+				cmd.SetArgs(cmdArgs)
+			}
+			err = cmd.Execute()
+			if tc.expectedErr != "" {
+				r.Contains(err.Error(), tc.expectedErr)
+				return
+			}
+			r.NoError(err)
+
+			wf := &v1beta1.Application{}
+			err = client.Get(ctx, types.NamespacedName{
+				Namespace: tc.app.Namespace,
+				Name:      tc.app.Name,
+			}, wf)
+			r.NoError(err)
+			r.Equal(true, wf.Status.Workflow.Suspend)
+			r.Equal(tc.expected.Status, wf.Status)
+		})
+	}
+}
+
+func TestWorkflowResume(t *testing.T) {
+	c := initArgs()
+	ioStream := cmdutil.IOStreams{In: os.Stdin, Out: os.Stdout, ErrOut: os.Stderr}
+	ctx := context.TODO()
+
+	testCases := map[string]struct {
+		app         *v1beta1.Application
+		expectedErr error
+	}{
+		"no app name specified": {
+			expectedErr: fmt.Errorf("please specify the name of application/workflow"),
+		},
+		"workflow not suspended": {
+			app: &v1beta1.Application{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "workflow-not-suspended",
+					Namespace: "default",
+				},
+				Spec: workflowSpec,
+				Status: common.AppStatus{
+					Workflow: &common.WorkflowStatus{
+						Suspend: false,
+					},
+				},
+			},
+		},
+		"workflow not running": {
+			app: &v1beta1.Application{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "workflow-not-running",
+					Namespace: "default",
+				},
+				Spec:   workflowSpec,
+				Status: common.AppStatus{},
+			},
+			expectedErr: fmt.Errorf("the workflow in application workflow-not-running is not start"),
+		},
+		"workflow terminated": {
+			app: &v1beta1.Application{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "workflow-terminated",
+					Namespace: "default",
+				},
+				Spec: workflowSpec,
+				Status: common.AppStatus{
+					Workflow: &common.WorkflowStatus{
+						Terminated: true,
+					},
+				},
+			},
+			expectedErr: fmt.Errorf("can not resume a terminated workflow"),
+		},
+		"resume successfully": {
+			app: &v1beta1.Application{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "workflow",
+					Namespace: "test",
+				},
+				Spec: workflowSpec,
+				Status: common.AppStatus{
+					Workflow: &common.WorkflowStatus{
+						Suspend: true,
+						Steps: []workflowv1alpha1.WorkflowStepStatus{
+							{
+								StepStatus: workflowv1alpha1.StepStatus{
+									Type:  "suspend",
+									Phase: "running",
+								},
+							},
+							{
+								StepStatus: workflowv1alpha1.StepStatus{
+									Type: "step-group",
+								},
+								SubStepsStatus: []workflowv1alpha1.StepStatus{
+									{
+										Type:  "suspend",
+										Phase: "running",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			r := require.New(t)
+			cmd := NewWorkflowResumeCommand(c, ioStream, &WorkflowArgs{Args: c, Writer: ioStream.Out})
 			initCommand(cmd)
 			// clean up the arguments before start
 			cmd.SetArgs([]string{})
@@ -126,144 +464,14 @@ func TestWorkflowSuspend(t *testing.T) {
 				Name:      tc.app.Name,
 			}, wf)
 			r.NoError(err)
-			r.Equal(true, wf.Status.Workflow.Suspend)
-		})
-	}
-}
-
-func TestWorkflowResume(t *testing.T) {
-	c := initArgs()
-	ioStream := cmdutil.IOStreams{In: os.Stdin, Out: os.Stdout, ErrOut: os.Stderr}
-	ctx := context.TODO()
-
-	testCases := map[string]struct {
-		app         *v1beta1.Application
-		expectedErr error
-	}{
-		"no app name specified": {
-			expectedErr: fmt.Errorf("must specify application name"),
-		},
-		"workflow not suspended": {
-			app: &v1beta1.Application{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "workflow-not-suspended",
-					Namespace: "default",
-				},
-				Spec: workflowSpec,
-				Status: common.AppStatus{
-					Workflow: &common.WorkflowStatus{
-						Suspend: false,
-					},
-				},
-			},
-		},
-		"workflow not running": {
-			app: &v1beta1.Application{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "workflow-not-running",
-					Namespace: "default",
-				},
-				Spec:   workflowSpec,
-				Status: common.AppStatus{},
-			},
-			expectedErr: fmt.Errorf("the workflow in application is not running"),
-		},
-		"workflow terminated": {
-			app: &v1beta1.Application{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "workflow-terminated",
-					Namespace: "default",
-				},
-				Spec: workflowSpec,
-				Status: common.AppStatus{
-					Workflow: &common.WorkflowStatus{
-						Terminated: true,
-					},
-				},
-			},
-			expectedErr: fmt.Errorf("can not resume a terminated workflow"),
-		},
-		"resume successfully": {
-			app: &v1beta1.Application{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "workflow",
-					Namespace: "test",
-				},
-				Spec: workflowSpec,
-				Status: common.AppStatus{
-					Workflow: &common.WorkflowStatus{
-						Suspend: true,
-						Steps: []common.WorkflowStepStatus{
-							{
-								StepStatus: common.StepStatus{
-									Type:  "suspend",
-									Phase: "running",
-								},
-							},
-							{
-								StepStatus: common.StepStatus{
-									Type: "step-group",
-								},
-								SubStepsStatus: []common.WorkflowSubStepStatus{
-									{
-										StepStatus: common.StepStatus{
-											Type:  "suspend",
-											Phase: "running",
-										},
-									},
-								},
-							},
-						},
-					},
-				},
-			},
-		},
-	}
-
-	for name, tc := range testCases {
-		t.Run(name, func(t *testing.T) {
-			r := require.New(t)
-			cmd := NewWorkflowResumeCommand(c, ioStream)
-			initCommand(cmd)
-			client, err := c.GetClient()
-			r.NoError(err)
-			if tc.app != nil {
-				err := client.Create(ctx, tc.app)
-				r.NoError(err)
-
-				if tc.app.Namespace != corev1.NamespaceDefault {
-					err := client.Create(ctx, &corev1.Namespace{
-						ObjectMeta: metav1.ObjectMeta{
-							Name: tc.app.Namespace,
-						},
-					})
-					r.NoError(err)
-					cmd.SetArgs([]string{tc.app.Name, "-n", tc.app.Namespace})
-				} else {
-					cmd.SetArgs([]string{tc.app.Name})
-				}
-			}
-			err = cmd.Execute()
-			if tc.expectedErr != nil {
-				r.Equal(tc.expectedErr, err)
-				return
-			}
-			r.NoError(err)
-
-			wf := &v1beta1.Application{}
-			err = client.Get(ctx, types.NamespacedName{
-				Namespace: tc.app.Namespace,
-				Name:      tc.app.Name,
-			}, wf)
-			r.NoError(err)
 			r.Equal(false, wf.Status.Workflow.Suspend)
 			for _, step := range wf.Status.Workflow.Steps {
 				if step.Type == "suspend" {
-					r.Equal(step.Phase, common.WorkflowStepPhaseSucceeded)
+					r.Equal(step.Phase, workflowv1alpha1.WorkflowStepPhaseRunning)
 				}
 				for _, sub := range step.SubStepsStatus {
 					if sub.Type == "suspend" {
-						r.Equal(sub.Phase, common.WorkflowStepPhaseSucceeded)
+						r.Equal(sub.Phase, workflowv1alpha1.WorkflowStepPhaseRunning)
 					}
 				}
 			}
@@ -281,7 +489,7 @@ func TestWorkflowTerminate(t *testing.T) {
 		expectedErr error
 	}{
 		"no app name specified": {
-			expectedErr: fmt.Errorf("must specify application name"),
+			expectedErr: fmt.Errorf("please specify the name of application/workflow"),
 		},
 		"workflow not running": {
 			app: &v1beta1.Application{
@@ -292,7 +500,7 @@ func TestWorkflowTerminate(t *testing.T) {
 				Spec:   workflowSpec,
 				Status: common.AppStatus{},
 			},
-			expectedErr: fmt.Errorf("the workflow in application is not running"),
+			expectedErr: fmt.Errorf("the workflow in application workflow-not-running is not start"),
 		},
 		"terminate successfully": {
 			app: &v1beta1.Application{
@@ -304,39 +512,35 @@ func TestWorkflowTerminate(t *testing.T) {
 				Status: common.AppStatus{
 					Workflow: &common.WorkflowStatus{
 						Terminated: false,
-						Steps: []common.WorkflowStepStatus{
+						Steps: []workflowv1alpha1.WorkflowStepStatus{
 							{
-								StepStatus: common.StepStatus{
+								StepStatus: workflowv1alpha1.StepStatus{
 									Name:  "1",
 									Type:  "suspend",
 									Phase: "succeeded",
 								},
 							},
 							{
-								StepStatus: common.StepStatus{
+								StepStatus: workflowv1alpha1.StepStatus{
 									Name:  "2",
 									Type:  "suspend",
 									Phase: "running",
 								},
 							},
 							{
-								StepStatus: common.StepStatus{
+								StepStatus: workflowv1alpha1.StepStatus{
 									Name:  "3",
 									Type:  "step-group",
 									Phase: "running",
 								},
-								SubStepsStatus: []common.WorkflowSubStepStatus{
+								SubStepsStatus: []workflowv1alpha1.StepStatus{
 									{
-										StepStatus: common.StepStatus{
-											Type:  "suspend",
-											Phase: "running",
-										},
+										Type:  "suspend",
+										Phase: "running",
 									},
 									{
-										StepStatus: common.StepStatus{
-											Type:  "suspend",
-											Phase: "succeeded",
-										},
+										Type:  "suspend",
+										Phase: "succeeded",
 									},
 								},
 							},
@@ -350,8 +554,10 @@ func TestWorkflowTerminate(t *testing.T) {
 	for name, tc := range testCases {
 		t.Run(name, func(t *testing.T) {
 			r := require.New(t)
-			cmd := NewWorkflowTerminateCommand(c, ioStream)
+			cmd := NewWorkflowTerminateCommand(c, ioStream, &WorkflowArgs{Args: c, Writer: ioStream.Out})
 			initCommand(cmd)
+			// clean up the arguments before start
+			cmd.SetArgs([]string{})
 			client, err := c.GetClient()
 			r.NoError(err)
 			if tc.app != nil {
@@ -385,15 +591,14 @@ func TestWorkflowTerminate(t *testing.T) {
 			r.NoError(err)
 			r.Equal(true, wf.Status.Workflow.Terminated)
 			for _, step := range wf.Status.Workflow.Steps {
-				if step.Phase != common.WorkflowStepPhaseSucceeded {
-					fmt.Println("======", step.Name)
-					r.Equal(step.Phase, common.WorkflowStepPhaseFailed)
-					r.Equal(step.Reason, custom.StatusReasonTerminate)
+				if step.Phase != workflowv1alpha1.WorkflowStepPhaseSucceeded {
+					r.Equal(step.Phase, workflowv1alpha1.WorkflowStepPhaseFailed)
+					r.Equal(step.Reason, wfTypes.StatusReasonTerminate)
 				}
 				for _, sub := range step.SubStepsStatus {
-					if sub.Phase != common.WorkflowStepPhaseSucceeded {
-						r.Equal(sub.Phase, common.WorkflowStepPhaseFailed)
-						r.Equal(sub.Reason, custom.StatusReasonTerminate)
+					if sub.Phase != workflowv1alpha1.WorkflowStepPhaseSucceeded {
+						r.Equal(sub.Phase, workflowv1alpha1.WorkflowStepPhaseFailed)
+						r.Equal(sub.Reason, wfTypes.StatusReasonTerminate)
 					}
 				}
 			}
@@ -411,7 +616,7 @@ func TestWorkflowRestart(t *testing.T) {
 		expectedErr error
 	}{
 		"no app name specified": {
-			expectedErr: fmt.Errorf("must specify application name"),
+			expectedErr: fmt.Errorf("please specify the name of application/workflow"),
 		},
 		"workflow not running": {
 			app: &v1beta1.Application{
@@ -422,7 +627,7 @@ func TestWorkflowRestart(t *testing.T) {
 				Spec:   workflowSpec,
 				Status: common.AppStatus{},
 			},
-			expectedErr: fmt.Errorf("the workflow in application is not running"),
+			expectedErr: fmt.Errorf("the workflow in application workflow-not-running is not start"),
 		},
 		"restart successfully": {
 			app: &v1beta1.Application{
@@ -443,8 +648,10 @@ func TestWorkflowRestart(t *testing.T) {
 	for name, tc := range testCases {
 		t.Run(name, func(t *testing.T) {
 			r := require.New(t)
-			cmd := NewWorkflowRestartCommand(c, ioStream)
+			cmd := NewWorkflowRestartCommand(c, ioStream, &WorkflowArgs{Args: c, Writer: ioStream.Out})
 			initCommand(cmd)
+			// clean up the arguments before start
+			cmd.SetArgs([]string{})
 			client, err := c.GetClient()
 			r.NoError(err)
 			if tc.app != nil {
@@ -493,12 +700,12 @@ func TestWorkflowRollback(t *testing.T) {
 		expectedErr error
 	}{
 		"no app name specified": {
-			expectedErr: fmt.Errorf("must specify application name"),
+			expectedErr: fmt.Errorf("please specify the name of application/workflow"),
 		},
 		"workflow running": {
 			app: &v1beta1.Application{
 				ObjectMeta: metav1.ObjectMeta{
-					Name:      "workflow-not-running",
+					Name:      "workflow-running",
 					Namespace: "default",
 				},
 				Spec: workflowSpec,
@@ -549,13 +756,15 @@ func TestWorkflowRollback(t *testing.T) {
 					Namespace: "test",
 				},
 				Spec: v1beta1.ApplicationRevisionSpec{
-					Application: v1beta1.Application{
-						Spec: v1beta1.ApplicationSpec{
-							Components: []common.ApplicationComponent{{
-								Name:       "revision-component",
-								Type:       "worker",
-								Properties: &runtime.RawExtension{Raw: []byte(`{"cmd":["sleep","1000"],"image":"busybox"}`)},
-							}},
+					ApplicationRevisionCompressibleFields: v1beta1.ApplicationRevisionCompressibleFields{
+						Application: v1beta1.Application{
+							Spec: v1beta1.ApplicationSpec{
+								Components: []common.ApplicationComponent{{
+									Name:       "revision-component",
+									Type:       "worker",
+									Properties: &runtime.RawExtension{Raw: []byte(`{"cmd":["sleep","1000"],"image":"busybox"}`)},
+								}},
+							},
 						},
 					},
 				},
@@ -566,8 +775,10 @@ func TestWorkflowRollback(t *testing.T) {
 	for name, tc := range testCases {
 		t.Run(name, func(t *testing.T) {
 			r := require.New(t)
-			cmd := NewWorkflowRollbackCommand(c, ioStream)
+			cmd := NewWorkflowRollbackCommand(c, ioStream, &WorkflowArgs{Args: c, Writer: ioStream.Out})
 			initCommand(cmd)
+			// clean up the arguments before start
+			cmd.SetArgs([]string{})
 			client, err := c.GetClient()
 			r.NoError(err)
 			if tc.app != nil {

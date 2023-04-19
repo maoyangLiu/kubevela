@@ -20,18 +20,24 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-
 	"sort"
 
 	"github.com/Masterminds/semver/v3"
+	"github.com/pkg/errors"
+	"helm.sh/helm/v3/pkg/chart/loader"
+	"helm.sh/helm/v3/pkg/repo"
+	"k8s.io/klog/v2"
 
-	"github.com/oam-dev/kubevela/pkg/apiserver/utils/log"
 	"github.com/oam-dev/kubevela/pkg/utils"
 	"github.com/oam-dev/kubevela/pkg/utils/common"
 	"github.com/oam-dev/kubevela/pkg/utils/helm"
+)
 
-	"helm.sh/helm/v3/pkg/chart/loader"
-	"helm.sh/helm/v3/pkg/repo"
+const (
+	// velaSystemRequirement is the vela version requirement annotation key
+	velaSystemRequirement = `system.vela`
+	// kubernetesSystemRequirement is the kubernetes requirement annotation key
+	kubernetesSystemRequirement = `system.kubernetes`
 )
 
 // VersionedRegistry is the interface of support version registry
@@ -40,6 +46,7 @@ type VersionedRegistry interface {
 	GetAddonUIData(ctx context.Context, addonName, version string) (*UIData, error)
 	GetAddonInstallPackage(ctx context.Context, addonName, version string) (*InstallPackage, error)
 	GetDetailedAddon(ctx context.Context, addonName, version string) (*WholeAddonPackage, error)
+	GetAddonAvailableVersion(addonName string) ([]*repo.ChartVersion, error)
 }
 
 // BuildVersionedRegistry is build versioned addon registry
@@ -80,6 +87,7 @@ func (i *versionedRegistry) GetAddonUIData(ctx context.Context, addonName, versi
 		Detail:            wholePackage.Detail,
 		Definitions:       wholePackage.Definitions,
 		AvailableVersions: wholePackage.AvailableVersions,
+		CUEDefinitions:    wholePackage.CUEDefinitions,
 	}, nil
 }
 
@@ -97,6 +105,11 @@ func (i *versionedRegistry) GetDetailedAddon(ctx context.Context, addonName, ver
 		return nil, err
 	}
 	return wholePackage, nil
+}
+
+// GetAddonAvailableVersion will return all available versions of the addon which is loaded from the registry, and the version are sorted from last to first
+func (i versionedRegistry) GetAddonAvailableVersion(addonName string) ([]*repo.ChartVersion, error) {
+	return i.loadAddonVersions(addonName)
 }
 
 func (i *versionedRegistry) resolveAddonListFromIndex(repoName string, index *repo.IndexFile) []*UIData {
@@ -134,8 +147,9 @@ func (i versionedRegistry) loadAddon(ctx context.Context, name, version string) 
 	sort.Sort(sort.Reverse(versions))
 	addonVersion, availableVersions := chooseVersion(version, versions)
 	if addonVersion == nil {
-		return nil, fmt.Errorf("specified version %s not exist", version)
+		return nil, errors.Errorf("specified version %s not exist", utils.Sanitize(version))
 	}
+	klog.V(5).Infof("Addon '%s' with version '%s' found from registry '%s'", addonVersion.Name, addonVersion.Version, i.name)
 	for _, chartURL := range addonVersion.URLs {
 		if !utils.IsValidURL(chartURL) {
 			chartURL, err = utils.JoinURL(i.url, chartURL)
@@ -145,10 +159,12 @@ func (i versionedRegistry) loadAddon(ctx context.Context, name, version string) 
 		}
 		archive, err := common.HTTPGetWithOption(ctx, chartURL, i.Opts)
 		if err != nil {
+			klog.Warningf("failed to download the addon package %s:%s", chartURL, err.Error())
 			continue
 		}
 		bufferedFile, err := loader.LoadArchiveFiles(bytes.NewReader(archive))
 		if err != nil {
+			klog.Warningf("failed to load the addon package:%s", err.Error())
 			continue
 		}
 		addonPkg, err := loadAddonPackage(name, bufferedFile)
@@ -157,9 +173,24 @@ func (i versionedRegistry) loadAddon(ctx context.Context, name, version string) 
 		}
 		addonPkg.AvailableVersions = availableVersions
 		addonPkg.RegistryName = i.name
+		addonPkg.Meta.SystemRequirements = LoadSystemRequirements(addonVersion.Annotations)
+		klog.V(5).Infof("Addon '%s' with version '%s' loaded successfully from registry '%s'", addonVersion.Name, addonVersion.Version, i.name)
 		return addonPkg, nil
 	}
-	return nil, fmt.Errorf("cannot fetch addon package")
+	return nil, ErrFetch
+}
+
+// loadAddonVersions Load all available versions of the addon
+func (i versionedRegistry) loadAddonVersions(addonName string) ([]*repo.ChartVersion, error) {
+	versions, err := i.h.ListVersions(i.url, addonName, false, i.Opts)
+	if err != nil {
+		return nil, err
+	}
+	if len(versions) == 0 {
+		return nil, ErrNotExist
+	}
+	sort.Sort(sort.Reverse(versions))
+	return versions, nil
 }
 
 func loadAddonPackage(addonName string, files []*loader.BufferedFile) (*WholeAddonPackage, error) {
@@ -207,8 +238,22 @@ func chooseVersion(specifiedVersion string, versions []*repo.ChartVersion) (*rep
 				continue
 			}
 			addonVersion = v
-			log.Logger.Infof("Not specified any version, so use the latest version %s", v.Version)
 		}
 	}
 	return addonVersion, availableVersions
+}
+
+// LoadSystemRequirements load the system version requirements from the addon's meta file
+func LoadSystemRequirements(anno map[string]string) *SystemRequirements {
+	if len(anno) == 0 {
+		return nil
+	}
+	req := &SystemRequirements{}
+	if _, ok := anno[velaSystemRequirement]; ok {
+		req.VelaVersion = anno[velaSystemRequirement]
+	}
+	if _, ok := anno[kubernetesSystemRequirement]; ok {
+		req.KubernetesVersion = anno[kubernetesSystemRequirement]
+	}
+	return req
 }

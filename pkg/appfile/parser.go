@@ -28,7 +28,12 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	ktypes "k8s.io/apimachinery/pkg/types"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	monitorContext "github.com/kubevela/pkg/monitor/context"
+	workflowv1alpha1 "github.com/kubevela/workflow/api/v1alpha1"
+	"github.com/kubevela/workflow/pkg/cue/packages"
 
 	"github.com/oam-dev/kubevela/apis/core.oam.dev/common"
 	"github.com/oam-dev/kubevela/apis/core.oam.dev/v1alpha1"
@@ -37,16 +42,15 @@ import (
 	"github.com/oam-dev/kubevela/pkg/auth"
 	"github.com/oam-dev/kubevela/pkg/component"
 	"github.com/oam-dev/kubevela/pkg/cue/definition"
-	"github.com/oam-dev/kubevela/pkg/cue/packages"
-	monitorContext "github.com/oam-dev/kubevela/pkg/monitor/context"
+	"github.com/oam-dev/kubevela/pkg/features"
 	"github.com/oam-dev/kubevela/pkg/monitor/metrics"
 	"github.com/oam-dev/kubevela/pkg/oam"
 	"github.com/oam-dev/kubevela/pkg/oam/discoverymapper"
 	"github.com/oam-dev/kubevela/pkg/oam/util"
 	policypkg "github.com/oam-dev/kubevela/pkg/policy"
 	"github.com/oam-dev/kubevela/pkg/utils"
+	utilscommon "github.com/oam-dev/kubevela/pkg/utils/common"
 	"github.com/oam-dev/kubevela/pkg/workflow/step"
-	wftypes "github.com/oam-dev/kubevela/pkg/workflow/types"
 )
 
 // TemplateLoaderFn load template of a capability definition
@@ -90,7 +94,7 @@ func NewDryRunApplicationParser(cli client.Client, dm discoverymapper.DiscoveryM
 func (p *Parser) GenerateAppFile(ctx context.Context, app *v1beta1.Application) (*Appfile, error) {
 	if ctx, ok := ctx.(monitorContext.Context); ok {
 		subCtx := ctx.Fork("generate-app-file", monitorContext.DurationMetric(func(v float64) {
-			metrics.ParseAppFileDurationHistogram.WithLabelValues("application").Observe(v)
+			metrics.AppReconcileStageDurationHistogram.WithLabelValues("generate-appfile").Observe(v)
 		}))
 		defer subCtx.Commit("finish generate appFile")
 	}
@@ -294,7 +298,7 @@ func (p *Parser) GenerateAppFileFromRevision(appRev *v1beta1.ApplicationRevision
 	if len(appfile.RelatedWorkflowStepDefinitions) == 0 && len(appfile.WorkflowSteps) > 0 {
 		ctx := context.Background()
 		for _, workflowStep := range appfile.WorkflowSteps {
-			if wftypes.IsBuiltinWorkflowStepType(workflowStep.Type) {
+			if step.IsBuiltinWorkflowStepType(workflowStep.Type) {
 				continue
 			}
 			if _, found := appfile.RelatedWorkflowStepDefinitions[workflowStep.Type]; found {
@@ -307,9 +311,9 @@ func (p *Parser) GenerateAppFileFromRevision(appRev *v1beta1.ApplicationRevision
 			appfile.RelatedWorkflowStepDefinitions[workflowStep.Type] = def
 		}
 
-		appRev.Spec.WorkflowStepDefinitions = make(map[string]v1beta1.WorkflowStepDefinition)
+		appRev.Spec.WorkflowStepDefinitions = make(map[string]*v1beta1.WorkflowStepDefinition)
 		for name, def := range appfile.RelatedWorkflowStepDefinitions {
-			appRev.Spec.WorkflowStepDefinitions[name] = *def
+			appRev.Spec.WorkflowStepDefinitions[name] = def
 		}
 	}
 
@@ -349,6 +353,19 @@ func (p *Parser) parseReferredObjects(ctx context.Context, af *Appfile) error {
 			}
 			af.ReferredObjects = component.AppendUnstructuredObjects(af.ReferredObjects, objs...)
 		}
+		if utilfeature.DefaultMutableFeatureGate.Enabled(features.DisableReferObjectsFromURL) && len(spec.URLs) > 0 {
+			return fmt.Errorf("referring objects from url is disabled")
+		}
+		for _, url := range spec.URLs {
+			objs, err := utilscommon.HTTPGetKubernetesObjects(ctx, url)
+			if err != nil {
+				return fmt.Errorf("failed to load Kubernetes objects from url %s: %w", url, err)
+			}
+			for _, obj := range objs {
+				util.AddAnnotations(obj, map[string]string{oam.AnnotationResourceURL: url})
+			}
+			af.ReferredObjects = component.AppendUnstructuredObjects(af.ReferredObjects, objs...)
+		}
 	}
 	sort.Slice(af.ReferredObjects, func(i, j int) bool {
 		a, b := af.ReferredObjects[i], af.ReferredObjects[j]
@@ -365,9 +382,15 @@ func (p *Parser) parsePoliciesFromRevision(ctx context.Context, af *Appfile) (er
 		return err
 	}
 	for _, policy := range af.Policies {
+		if policy.Properties == nil && policy.Type != v1alpha1.DebugPolicyType {
+			return fmt.Errorf("policy %s named %s must not have empty properties", policy.Type, policy.Name)
+		}
 		switch policy.Type {
 		case v1alpha1.GarbageCollectPolicyType:
 		case v1alpha1.ApplyOncePolicyType:
+		case v1alpha1.SharedResourcePolicyType:
+		case v1alpha1.TakeOverPolicyType:
+		case v1alpha1.ReadOnlyPolicyType:
 		case v1alpha1.EnvBindingPolicyType:
 		case v1alpha1.TopologyPolicyType:
 		case v1alpha1.OverridePolicyType:
@@ -390,11 +413,18 @@ func (p *Parser) parsePolicies(ctx context.Context, af *Appfile) (err error) {
 		return err
 	}
 	for _, policy := range af.Policies {
+		if policy.Properties == nil && policy.Type != v1alpha1.DebugPolicyType {
+			return fmt.Errorf("policy %s named %s must not have empty properties", policy.Type, policy.Name)
+		}
 		switch policy.Type {
 		case v1alpha1.GarbageCollectPolicyType:
 		case v1alpha1.ApplyOncePolicyType:
+		case v1alpha1.SharedResourcePolicyType:
+		case v1alpha1.TakeOverPolicyType:
+		case v1alpha1.ReadOnlyPolicyType:
 		case v1alpha1.EnvBindingPolicyType:
 		case v1alpha1.TopologyPolicyType:
+		case v1alpha1.ReplicationPolicyType:
 		case v1alpha1.DebugPolicyType:
 			af.Debug = true
 		case v1alpha1.OverridePolicyType:
@@ -422,17 +452,36 @@ func (p *Parser) parsePolicies(ctx context.Context, af *Appfile) (err error) {
 func (p *Parser) loadWorkflowToAppfile(ctx context.Context, af *Appfile) error {
 	var err error
 	// parse workflow steps
-	af.WorkflowMode = common.WorkflowModeDAG
-	if wfSpec := af.app.Spec.Workflow; wfSpec != nil && len(wfSpec.Steps) > 0 {
-		af.WorkflowMode = common.WorkflowModeStep
+	af.WorkflowMode = &workflowv1alpha1.WorkflowExecuteMode{
+		Steps:    workflowv1alpha1.WorkflowModeDAG,
+		SubSteps: workflowv1alpha1.WorkflowModeDAG,
+	}
+	if wfSpec := af.app.Spec.Workflow; wfSpec != nil {
+		app := af.app
+		mode := wfSpec.Mode
+		if wfSpec.Ref != "" && mode == nil {
+			wf := &workflowv1alpha1.Workflow{}
+			if err := af.WorkflowClient(p.client).Get(ctx, ktypes.NamespacedName{Namespace: af.app.Namespace, Name: app.Spec.Workflow.Ref}, wf); err != nil {
+				return err
+			}
+			mode = wf.Mode
+		}
 		af.WorkflowSteps = wfSpec.Steps
+		af.WorkflowMode.Steps = workflowv1alpha1.WorkflowModeStep
+		if mode != nil {
+			if mode.Steps != "" {
+				af.WorkflowMode.Steps = mode.Steps
+			}
+			if mode.SubSteps != "" {
+				af.WorkflowMode.SubSteps = mode.SubSteps
+			}
+		}
 	}
 	af.WorkflowSteps, err = step.NewChainWorkflowStepGenerator(
 		&step.RefWorkflowStepGenerator{Client: af.WorkflowClient(p.client), Context: ctx},
 		&step.DeployWorkflowStepGenerator{},
 		&step.Deploy2EnvWorkflowStepGenerator{},
 		&step.ApplyComponentWorkflowStepGenerator{},
-		&step.DeployPreApproveWorkflowStepGenerator{},
 	).Generate(af.app, af.WorkflowSteps)
 	return err
 }
@@ -464,7 +513,7 @@ func (p *Parser) parseWorkflowSteps(ctx context.Context, af *Appfile) error {
 }
 
 func (p *Parser) parseWorkflowStep(ctx context.Context, af *Appfile, workflowStepType string) error {
-	if wftypes.IsBuiltinWorkflowStepType(workflowStepType) {
+	if step.IsBuiltinWorkflowStepType(workflowStepType) {
 		return nil
 	}
 	if _, found := af.RelatedWorkflowStepDefinitions[workflowStepType]; found {
@@ -477,6 +526,7 @@ func (p *Parser) parseWorkflowStep(ctx context.Context, af *Appfile, workflowSte
 	af.RelatedWorkflowStepDefinitions[workflowStepType] = def
 	return nil
 }
+
 func (p *Parser) makeWorkload(ctx context.Context, name, typ string, capType types.CapType, props *runtime.RawExtension) (*Workload, error) {
 	templ, err := p.tmplLoader.LoadTemplate(ctx, p.dm, p.client, typ, capType)
 	if err != nil {
@@ -587,6 +637,53 @@ func (p *Parser) ParseWorkloadFromRevision(comp common.ApplicationComponent, app
 	return workload, nil
 }
 
+// ParseWorkloadFromRevisionAndClient resolve an ApplicationComponent and generate a Workload
+// containing ALL information required by an Appfile from app revision, and will fall back to
+// load external definitions if not found
+func (p *Parser) ParseWorkloadFromRevisionAndClient(ctx context.Context, comp common.ApplicationComponent, appRev *v1beta1.ApplicationRevision) (*Workload, error) {
+	workload, err := p.makeWorkloadFromRevision(comp.Name, comp.Type, types.TypeComponentDefinition, comp.Properties, appRev)
+	if IsNotFoundInAppRevision(err) {
+		workload, err = p.makeWorkload(ctx, comp.Name, comp.Type, types.TypeComponentDefinition, comp.Properties)
+	}
+	if err != nil {
+		return nil, err
+	}
+	workload.ExternalRevision = comp.ExternalRevision
+
+	for _, traitValue := range comp.Traits {
+		properties, err := util.RawExtension2Map(traitValue.Properties)
+		if err != nil {
+			return nil, errors.Errorf("fail to parse properties of %s for %s", traitValue.Type, comp.Name)
+		}
+		trait, err := p.parseTraitFromRevision(traitValue.Type, properties, appRev)
+		if IsNotFoundInAppRevision(err) {
+			trait, err = p.parseTrait(ctx, traitValue.Type, properties)
+		}
+		if err != nil {
+			return nil, errors.WithMessagef(err, "component(%s) parse trait(%s)", comp.Name, traitValue.Type)
+		}
+
+		workload.Traits = append(workload.Traits, trait)
+	}
+
+	for scopeType, instanceName := range comp.Scopes {
+		sd, gvk, err := GetScopeDefAndGVKFromRevision(scopeType, appRev)
+		if IsNotFoundInAppRevision(err) {
+			sd, gvk, err = GetScopeDefAndGVK(ctx, p.client, p.dm, scopeType)
+		}
+		if err != nil {
+			return nil, err
+		}
+		workload.Scopes = append(workload.Scopes, Scope{
+			Name:            instanceName,
+			GVK:             gvk,
+			ResourceVersion: sd.Spec.Reference.Name + "/" + sd.Spec.Reference.Version,
+		})
+		workload.ScopeDefinition = append(workload.ScopeDefinition, sd)
+	}
+	return workload, nil
+}
+
 func (p *Parser) parseTrait(ctx context.Context, name string, properties map[string]interface{}) (*Trait, error) {
 	templ, err := p.tmplLoader.LoadTemplate(ctx, p.dm, p.client, name, types.TypeTrait)
 	if kerrors.IsNotFound(err) {
@@ -624,38 +721,14 @@ func (p *Parser) convertTemplate2Trait(name string, properties map[string]interf
 }
 
 // ValidateComponentNames validate all component name whether repeat in cluster and template
-func (p *Parser) ValidateComponentNames(ctx context.Context, af *Appfile) (int, error) {
-	existCompNames := make(map[string]string)
-	existApps := v1beta1.ApplicationList{}
-
-	listOpts := []client.ListOption{
-		client.InNamespace(af.Namespace),
-	}
-	if err := p.client.List(ctx, &existApps, listOpts...); err != nil {
-		return 0, err
-	}
-	for _, existApp := range existApps.Items {
-		ea := existApp.DeepCopy()
-		existAf, err := p.GenerateAppFile(ctx, ea)
-		if err != nil || existAf.Name == af.Name {
-			continue
+func (p *Parser) ValidateComponentNames(app *v1beta1.Application) (int, error) {
+	compNames := map[string]struct{}{}
+	for idx, comp := range app.Spec.Components {
+		if _, found := compNames[comp.Name]; found {
+			return idx, fmt.Errorf("duplicated component name %s", comp.Name)
 		}
-		for _, existComp := range existAf.Workloads {
-			existCompNames[existComp.Name] = existApp.Name
-		}
+		compNames[comp.Name] = struct{}{}
 	}
-
-	for i, wl := range af.Workloads {
-		if existAfName, ok := existCompNames[wl.Name]; ok {
-			return i, fmt.Errorf("component named '%s' is already exist in application '%s'", wl.Name, existAfName)
-		}
-		for j := i + 1; j < len(af.Workloads); j++ {
-			if wl.Name == af.Workloads[j].Name {
-				return i, fmt.Errorf("component named '%s' is repeat in this appfile", wl.Name)
-			}
-		}
-	}
-
 	return 0, nil
 }
 

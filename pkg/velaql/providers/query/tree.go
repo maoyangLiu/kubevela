@@ -18,24 +18,28 @@ package query
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"sort"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	v12 "k8s.io/api/core/v1"
+	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	types2 "k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/duration"
+	"k8s.io/klog/v2"
 	"k8s.io/kubectl/pkg/util/podutils"
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/yaml"
 
 	velatypes "github.com/oam-dev/kubevela/apis/types"
-	"github.com/oam-dev/kubevela/pkg/apiserver/utils/log"
 	"github.com/oam-dev/kubevela/pkg/multicluster"
 	"github.com/oam-dev/kubevela/pkg/oam"
 	"github.com/oam-dev/kubevela/pkg/velaql/providers/query/types"
@@ -50,47 +54,180 @@ var relationshipKey = "rules"
 // set the iterator max depth is 5
 var maxDepth = 5
 
+// RuleList the rule list
+type RuleList []ChildrenResourcesRule
+
+// GetRule get the rule by the resource type
+func (rl *RuleList) GetRule(grt GroupResourceType) (*ChildrenResourcesRule, bool) {
+	for i, r := range *rl {
+		if r.GroupResourceType == grt {
+			return &(*rl)[i], true
+		}
+	}
+	return nil, false
+}
+
 // globalRule define the whole relationShip rule
-var globalRule map[GroupResourceType]ChildrenResourcesRule
+var globalRule RuleList
 
 func init() {
-	globalRule = make(map[GroupResourceType]ChildrenResourcesRule)
-	globalRule[GroupResourceType{Group: "apps", Kind: "Deployment"}] = ChildrenResourcesRule{
-		CareResource: map[ResourceType]genListOptionFunc{
-			{APIVersion: "apps/v1", Kind: "ReplicaSet"}: deploy2RsLabelListOption,
+	globalRule = append(globalRule,
+		ChildrenResourcesRule{
+			GroupResourceType: GroupResourceType{Group: "apps", Kind: "Deployment"},
+			SubResources: buildSubResources([]*SubResourceSelector{
+				{
+					ResourceType: ResourceType{APIVersion: "apps/v1", Kind: "ReplicaSet"},
+					listOptions:  defaultWorkloadLabelListOption,
+				},
+			}),
 		},
-	}
-	globalRule[GroupResourceType{Group: "apps", Kind: "ReplicaSet"}] = ChildrenResourcesRule{
-		CareResource: map[ResourceType]genListOptionFunc{
-			{APIVersion: "v1", Kind: "Pod"}: rs2PodLabelListOption,
+		ChildrenResourcesRule{
+			SubResources: buildSubResources([]*SubResourceSelector{
+				{
+					ResourceType: ResourceType{APIVersion: "v1", Kind: "Pod"},
+					listOptions:  defaultWorkloadLabelListOption,
+				},
+			}),
+			GroupResourceType: GroupResourceType{Group: "apps", Kind: "ReplicaSet"},
 		},
-	}
-	globalRule[GroupResourceType{Group: "apps", Kind: "StatefulSet"}] = ChildrenResourcesRule{
-		CareResource: map[ResourceType]genListOptionFunc{
-			{APIVersion: "v1", Kind: "Pod"}: statefulSet2PodListOption,
+		ChildrenResourcesRule{
+			SubResources: buildSubResources([]*SubResourceSelector{
+				{
+					ResourceType: ResourceType{APIVersion: "v1", Kind: "Pod"},
+					listOptions:  defaultWorkloadLabelListOption,
+				},
+			}),
+			GroupResourceType: GroupResourceType{Group: "apps", Kind: "StatefulSet"},
 		},
-	}
-	globalRule[GroupResourceType{Group: "", Kind: "Service"}] = ChildrenResourcesRule{
-		CareResource: map[ResourceType]genListOptionFunc{
-			{APIVersion: "discovery.k8s.io/v1beta1", Kind: "EndpointSlice"}: nil,
-			{APIVersion: "v1", Kind: "Endpoints"}:                           service2EndpointListOption,
+		ChildrenResourcesRule{
+			SubResources: buildSubResources([]*SubResourceSelector{
+				{
+					ResourceType: ResourceType{APIVersion: "v1", Kind: "Pod"},
+					listOptions:  defaultWorkloadLabelListOption,
+				},
+			}),
+			GroupResourceType: GroupResourceType{Group: "apps", Kind: "DaemonSet"},
 		},
-	}
-	globalRule[GroupResourceType{Group: "helm.toolkit.fluxcd.io", Kind: "HelmRelease"}] = ChildrenResourcesRule{
-		CareResource: map[ResourceType]genListOptionFunc{
-			{APIVersion: "apps/v1", Kind: "Deployment"}:                       nil,
-			{APIVersion: "apps/v1", Kind: "StatefulSet"}:                      nil,
-			{APIVersion: "v1", Kind: "ConfigMap"}:                             nil,
-			{APIVersion: "v1", Kind: "Secret"}:                                nil,
-			{APIVersion: "v1", Kind: "Service"}:                               nil,
-			{APIVersion: "v1", Kind: "PersistentVolumeClaim"}:                 nil,
-			{APIVersion: "networking.k8s.io/v1", Kind: "Ingress"}:             nil,
-			{APIVersion: "v1", Kind: "ServiceAccount"}:                        nil,
-			{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "Role"}:        nil,
-			{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "RoleBinding"}: nil,
+		ChildrenResourcesRule{
+			GroupResourceType: GroupResourceType{Group: "batch", Kind: "Job"},
+			SubResources: buildSubResources([]*SubResourceSelector{
+				{
+					ResourceType: ResourceType{APIVersion: "v1", Kind: "Pod"},
+					listOptions:  defaultWorkloadLabelListOption,
+				},
+			}),
 		},
-		DefaultGenListOptionFunc: helmRelease2AnyListOption,
-	}
+		ChildrenResourcesRule{
+			GroupResourceType: GroupResourceType{Group: "", Kind: "Service"},
+			SubResources: buildSubResources([]*SubResourceSelector{
+				{
+					ResourceType: ResourceType{APIVersion: "discovery.k8s.io/v1beta1", Kind: "EndpointSlice"},
+				},
+				{
+					ResourceType: ResourceType{APIVersion: "discovery.k8s.io/v1", Kind: "EndpointSlice"},
+				},
+				{
+					ResourceType: ResourceType{APIVersion: "v1", Kind: "Endpoints"},
+					listOptions:  service2EndpointListOption,
+				},
+			}),
+		},
+		ChildrenResourcesRule{
+			GroupResourceType: GroupResourceType{Group: "helm.toolkit.fluxcd.io", Kind: "HelmRelease"},
+			SubResources: buildSubResources([]*SubResourceSelector{
+				{
+					ResourceType: ResourceType{APIVersion: "apps/v1", Kind: "Deployment"},
+				},
+				{
+					ResourceType: ResourceType{APIVersion: "apps/v1", Kind: "StatefulSet"},
+				},
+				{
+					ResourceType: ResourceType{APIVersion: "v1", Kind: "ConfigMap"},
+				},
+				{
+					ResourceType: ResourceType{APIVersion: "v1", Kind: "Secret"},
+				},
+				{
+					ResourceType: ResourceType{APIVersion: "v1", Kind: "Service"},
+				},
+				{
+					ResourceType: ResourceType{APIVersion: "v1", Kind: "PersistentVolumeClaim"},
+				},
+				{
+					ResourceType: ResourceType{APIVersion: "networking.k8s.io/v1", Kind: "Ingress"},
+				},
+				{
+					ResourceType: ResourceType{APIVersion: "gateway.networking.k8s.io/v1alpha2", Kind: "HTTPRoute"},
+				},
+				{
+					ResourceType: ResourceType{APIVersion: "gateway.networking.k8s.io/v1alpha2", Kind: "Gateway"},
+				},
+				{
+					ResourceType: ResourceType{APIVersion: "v1", Kind: "ServiceAccount"},
+				},
+				{
+					ResourceType: ResourceType{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "Role"},
+				},
+				{
+					ResourceType: ResourceType{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "RoleBinding"},
+				},
+			}),
+			DefaultGenListOptionFunc:      helmRelease2AnyListOption,
+			DisableFilterByOwnerReference: true,
+		},
+		ChildrenResourcesRule{
+			GroupResourceType: GroupResourceType{Group: "kustomize.toolkit.fluxcd.io", Kind: "Kustomization"},
+			SubResources: buildSubResources([]*SubResourceSelector{
+				{
+					ResourceType: ResourceType{APIVersion: "apps/v1", Kind: "Deployment"},
+				},
+				{
+					ResourceType: ResourceType{APIVersion: "apps/v1", Kind: "StatefulSet"},
+				},
+				{
+					ResourceType: ResourceType{APIVersion: "v1", Kind: "ConfigMap"},
+				},
+				{
+					ResourceType: ResourceType{APIVersion: "v1", Kind: "Secret"},
+				},
+				{
+					ResourceType: ResourceType{APIVersion: "v1", Kind: "Service"},
+				},
+				{
+					ResourceType: ResourceType{APIVersion: "v1", Kind: "PersistentVolumeClaim"},
+				},
+				{
+					ResourceType: ResourceType{APIVersion: "networking.k8s.io/v1", Kind: "Ingress"},
+				},
+				{
+					ResourceType: ResourceType{APIVersion: "gateway.networking.k8s.io/v1alpha2", Kind: "HTTPRoute"},
+				},
+				{
+					ResourceType: ResourceType{APIVersion: "gateway.networking.k8s.io/v1alpha2", Kind: "Gateway"},
+				},
+				{
+					ResourceType: ResourceType{APIVersion: "v1", Kind: "ServiceAccount"},
+				},
+				{
+					ResourceType: ResourceType{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "Role"},
+				},
+				{
+					ResourceType: ResourceType{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "RoleBinding"},
+				},
+			}),
+			DefaultGenListOptionFunc:      kustomization2AnyListOption,
+			DisableFilterByOwnerReference: true,
+		},
+		ChildrenResourcesRule{
+			SubResources: buildSubResources([]*SubResourceSelector{
+				{
+					ResourceType: ResourceType{APIVersion: "batch/v1", Kind: "Job"},
+					listOptions:  cronJobLabelListOption,
+				},
+			}),
+			GroupResourceType: GroupResourceType{Group: "batch", Kind: "CronJob"},
+		},
+	)
 }
 
 // GroupResourceType define the parent resource type
@@ -108,56 +245,118 @@ type ResourceType struct {
 // customRule define the customize rule created by user
 type customRule struct {
 	ParentResourceType   *GroupResourceType `json:"parentResourceType,omitempty"`
-	ChildrenResourceType []ResourceType     `json:"childrenResourceType,omitempty"`
+	ChildrenResourceType []CustomSelector   `json:"childrenResourceType,omitempty"`
+}
+
+// CustomSelector the custom resource selector configuration in configmap. support set the default label selector policy
+type CustomSelector struct {
+	ResourceType `json:",inline"`
+	// defaultLabelSelector means read the label selector condition from the spec.selector.
+	DefaultLabelSelector bool `json:"defaultLabelSelector"`
 }
 
 // ChildrenResourcesRule define the relationShip between parentObject and children resource
 type ChildrenResourcesRule struct {
+	// GroupResourceType the root resource type
+	GroupResourceType GroupResourceType
 	// every subResourceType can have a specified genListOptionFunc.
-	CareResource map[ResourceType]genListOptionFunc
+	SubResources *SubResources
 	// if specified genListOptionFunc is nil will use use default genListOptionFunc to generate listOption.
 	DefaultGenListOptionFunc genListOptionFunc
+	// DisableFilterByOwnerReference means don't use parent resource's UID filter the result.
+	DisableFilterByOwnerReference bool
+}
+
+func buildSubResources(crs []*SubResourceSelector) *SubResources {
+	var cr SubResources = crs
+	return &cr
+}
+
+func buildSubResourceSelector(cus CustomSelector) *SubResourceSelector {
+	cr := SubResourceSelector{
+		ResourceType: cus.ResourceType,
+	}
+	if cus.DefaultLabelSelector {
+		cr.listOptions = defaultWorkloadLabelListOption
+	}
+	return &cr
+}
+
+// SubResources the sub resource definitions
+type SubResources []*SubResourceSelector
+
+// Get get the sub resource by the resource type
+func (c *SubResources) Get(rt ResourceType) *SubResourceSelector {
+	for _, r := range *c {
+		if r.ResourceType == rt {
+			return r
+		}
+	}
+	return nil
+}
+
+// Put add a sub resource to the list
+func (c *SubResources) Put(cr *SubResourceSelector) {
+	*c = append(*c, cr)
+}
+
+// SubResourceSelector the sub resource selector configuration
+type SubResourceSelector struct {
+	ResourceType
+	listOptions genListOptionFunc
 }
 
 type genListOptionFunc func(unstructured.Unstructured) (client.ListOptions, error)
 
-var deploy2RsLabelListOption = func(obj unstructured.Unstructured) (client.ListOptions, error) {
-	deploy := appsv1.Deployment{}
-	err := runtime.DefaultUnstructuredConverter.FromUnstructured(obj.Object, &deploy)
-	if err != nil {
-		return client.ListOptions{}, err
-	}
-	deploySelector, err := v1.LabelSelectorAsSelector(deploy.Spec.Selector)
-	if err != nil {
-		return client.ListOptions{}, err
-	}
-	return client.ListOptions{Namespace: deploy.Namespace, LabelSelector: deploySelector}, nil
+// WorkloadUnstructured the workload unstructured, such as Deployment、Job、StatefulSet、ReplicaSet and DaemonSet
+type WorkloadUnstructured struct {
+	unstructured.Unstructured
 }
 
-var rs2PodLabelListOption = func(obj unstructured.Unstructured) (client.ListOptions, error) {
-	rs := appsv1.ReplicaSet{}
-	err := runtime.DefaultUnstructuredConverter.FromUnstructured(obj.Object, &rs)
+// GetSelector get the selector from the field path
+func (w *WorkloadUnstructured) GetSelector(fields ...string) (labels.Selector, error) {
+	value, exist, err := unstructured.NestedFieldNoCopy(w.Object, fields...)
 	if err != nil {
-		return client.ListOptions{}, err
+		return nil, err
 	}
-	rsSelector, err := v1.LabelSelectorAsSelector(rs.Spec.Selector)
-	if err != nil {
-		return client.ListOptions{}, err
+	if !exist {
+		return labels.Everything(), nil
 	}
-	return client.ListOptions{Namespace: rs.Namespace, LabelSelector: rsSelector}, nil
+	if v, ok := value.(map[string]interface{}); ok {
+		var selector v1.LabelSelector
+		if err := runtime.DefaultUnstructuredConverter.FromUnstructured(v, &selector); err != nil {
+			return nil, err
+		}
+		return v1.LabelSelectorAsSelector(&selector)
+	}
+	return labels.Everything(), nil
 }
 
-var statefulSet2PodListOption = func(obj unstructured.Unstructured) (client.ListOptions, error) {
-	sts := appsv1.StatefulSet{}
-	err := runtime.DefaultUnstructuredConverter.FromUnstructured(obj.Object, &sts)
+func (w *WorkloadUnstructured) convertLabel2Selector(fields ...string) (labels.Selector, error) {
+	value, exist, err := unstructured.NestedFieldNoCopy(w.Object, fields...)
+	if err != nil {
+		return nil, err
+	}
+	if !exist {
+		return labels.Everything(), nil
+	}
+	if v, ok := value.(map[string]interface{}); ok {
+		var selector v1.LabelSelector
+		if err := runtime.DefaultUnstructuredConverter.FromUnstructured(v, &selector.MatchLabels); err != nil {
+			return nil, err
+		}
+		return v1.LabelSelectorAsSelector(&selector)
+	}
+	return labels.Everything(), nil
+}
+
+var defaultWorkloadLabelListOption genListOptionFunc = func(obj unstructured.Unstructured) (client.ListOptions, error) {
+	workload := WorkloadUnstructured{obj}
+	deploySelector, err := workload.GetSelector("spec", "selector")
 	if err != nil {
 		return client.ListOptions{}, err
 	}
-	stsSelector, err := v1.LabelSelectorAsSelector(sts.Spec.Selector)
-	if err != nil {
-		return client.ListOptions{}, err
-	}
-	return client.ListOptions{Namespace: sts.Namespace, LabelSelector: stsSelector}, nil
+	return client.ListOptions{Namespace: obj.GetNamespace(), LabelSelector: deploySelector}, nil
 }
 
 var service2EndpointListOption = func(obj unstructured.Unstructured) (client.ListOptions, error) {
@@ -173,6 +372,15 @@ var service2EndpointListOption = func(obj unstructured.Unstructured) (client.Lis
 	return client.ListOptions{Namespace: svc.Namespace, LabelSelector: stsSelector}, nil
 }
 
+var cronJobLabelListOption = func(obj unstructured.Unstructured) (client.ListOptions, error) {
+	workload := WorkloadUnstructured{obj}
+	cronJobSelector, err := workload.convertLabel2Selector("spec", "jobTemplate", "metadata", "labels")
+	if err != nil {
+		return client.ListOptions{}, err
+	}
+	return client.ListOptions{Namespace: obj.GetNamespace(), LabelSelector: cronJobSelector}, nil
+}
+
 var helmRelease2AnyListOption = func(obj unstructured.Unstructured) (client.ListOptions, error) {
 	hrSelector, err := v1.LabelSelectorAsSelector(&v1.LabelSelector{MatchLabels: map[string]string{
 		"helm.toolkit.fluxcd.io/name":      obj.GetName(),
@@ -182,6 +390,17 @@ var helmRelease2AnyListOption = func(obj unstructured.Unstructured) (client.List
 		return client.ListOptions{}, err
 	}
 	return client.ListOptions{LabelSelector: hrSelector}, nil
+}
+
+var kustomization2AnyListOption = func(obj unstructured.Unstructured) (client.ListOptions, error) {
+	kusSelector, err := v1.LabelSelectorAsSelector(&v1.LabelSelector{MatchLabels: map[string]string{
+		"kustomize.toolkit.fluxcd.io/name":      obj.GetName(),
+		"kustomize.toolkit.fluxcd.io/namespace": obj.GetNamespace(),
+	}})
+	if err != nil {
+		return client.ListOptions{}, err
+	}
+	return client.ListOptions{LabelSelector: kusSelector}, nil
 }
 
 type healthyCheckFunc func(obj unstructured.Unstructured) (*types.HealthStatus, error)
@@ -408,7 +627,8 @@ var checkServiceStatus = func(obj unstructured.Unstructured) (*types.HealthStatu
 	return &health, nil
 }
 
-func checkResourceStatus(obj unstructured.Unstructured) (*types.HealthStatus, error) {
+// CheckResourceStatus return object status data
+func CheckResourceStatus(obj unstructured.Unstructured) (*types.HealthStatus, error) {
 	group := obj.GroupVersionKind().Group
 	kind := obj.GroupVersionKind().Kind
 	var checkFunc healthyCheckFunc
@@ -462,6 +682,14 @@ func additionalInfo(obj unstructured.Unstructured) (map[string]interface{}, erro
 		case "Service":
 			infoFunc = svcAdditionalInfo
 		}
+	case "apps":
+		switch kind {
+		case "Deployment":
+			infoFunc = deploymentAdditionalInfo
+		case "StatefulSet":
+			infoFunc = statefulSetAdditionalInfo
+		default:
+		}
 	default:
 	}
 	if infoFunc != nil {
@@ -496,7 +724,7 @@ func svcAdditionalInfo(obj unstructured.Unstructured) (map[string]interface{}, e
 // the logic of this func totaly copy from the source-code of kubernetes tableConvertor
 // https://github.com/kubernetes/kubernetes/blob/ea0764452222146c47ec826977f49d7001b0ea8c/pkg/printers/internalversion/printers.go#L740
 // The result is same with the output of kubectl.
-//nolint
+// nolint
 func podAdditionalInfo(obj unstructured.Unstructured) (map[string]interface{}, error) {
 	pod := v12.Pod{}
 	err := runtime.DefaultUnstructuredConverter.FromUnstructured(obj.Object, &pod)
@@ -511,14 +739,6 @@ func podAdditionalInfo(obj unstructured.Unstructured) (map[string]interface{}, e
 			}
 		}
 		return false
-	}
-
-	translateTimestampSince := func(timestamp v1.Time) string {
-		if timestamp.IsZero() {
-			return "<unknown>"
-		}
-
-		return duration.HumanDuration(time.Since(timestamp.Time))
 	}
 
 	restarts := 0
@@ -604,6 +824,42 @@ func podAdditionalInfo(obj unstructured.Unstructured) (map[string]interface{}, e
 	}, nil
 }
 
+func deploymentAdditionalInfo(obj unstructured.Unstructured) (map[string]interface{}, error) {
+	deployment := appsv1.Deployment{}
+	err := runtime.DefaultUnstructuredConverter.FromUnstructured(obj.Object, &deployment)
+	if err != nil {
+		return nil, fmt.Errorf("failed to convert unstructured Deployment to typed: %w", err)
+	}
+
+	readyReplicas := deployment.Status.ReadyReplicas
+	desiredReplicas := deployment.Spec.Replicas
+	updatedReplicas := deployment.Status.UpdatedReplicas
+	availableReplicas := deployment.Status.AvailableReplicas
+
+	return map[string]interface{}{
+		"Ready":     fmt.Sprintf("%d/%d", readyReplicas, *desiredReplicas),
+		"Update":    updatedReplicas,
+		"Available": availableReplicas,
+		"Age":       translateTimestampSince(deployment.CreationTimestamp),
+	}, nil
+}
+
+func statefulSetAdditionalInfo(obj unstructured.Unstructured) (map[string]interface{}, error) {
+	statefulSet := appsv1.StatefulSet{}
+	err := runtime.DefaultUnstructuredConverter.FromUnstructured(obj.Object, &statefulSet)
+	if err != nil {
+		return nil, fmt.Errorf("failed to convert unstructured StatefulSet to typed: %w", err)
+	}
+
+	readyReplicas := statefulSet.Status.ReadyReplicas
+	desiredReplicas := statefulSet.Spec.Replicas
+
+	return map[string]interface{}{
+		"Ready": fmt.Sprintf("%d/%d", readyReplicas, *desiredReplicas),
+		"Age":   translateTimestampSince(statefulSet.CreationTimestamp),
+	}, nil
+}
+
 func fetchObjectWithResourceTreeNode(ctx context.Context, cluster string, k8sClient client.Client, resource types.ResourceTreeNode) (*unstructured.Unstructured, error) {
 	o := unstructured.Unstructured{}
 	o.SetAPIVersion(resource.APIVersion)
@@ -618,7 +874,7 @@ func fetchObjectWithResourceTreeNode(ctx context.Context, cluster string, k8sCli
 }
 
 func listItemByRule(clusterCTX context.Context, k8sClient client.Client, resource ResourceType,
-	parentObject unstructured.Unstructured, specifiedFunc genListOptionFunc, defaultFunc genListOptionFunc) ([]unstructured.Unstructured, error) {
+	parentObject unstructured.Unstructured, specifiedFunc genListOptionFunc, defaultFunc genListOptionFunc, disableFilterByOwner bool) ([]unstructured.Unstructured, error) {
 
 	itemList := unstructured.UnstructuredList{}
 	itemList.SetAPIVersion(resource.APIVersion)
@@ -638,6 +894,9 @@ func listItemByRule(clusterCTX context.Context, k8sClient client.Client, resourc
 				}
 			}
 		}
+		sort.Slice(res, func(i, j int) bool {
+			return res[i].GetName() < res[j].GetName()
+		})
 		return res, nil
 	}
 	var listOptions client.ListOptions
@@ -657,12 +916,29 @@ func listItemByRule(clusterCTX context.Context, k8sClient client.Client, resourc
 	if err != nil {
 		return nil, err
 	}
+	if !disableFilterByOwner {
+		var res []unstructured.Unstructured
+		for _, item := range itemList.Items {
+			if len(item.GetOwnerReferences()) == 0 {
+				res = append(res, item)
+			}
+			for _, reference := range item.GetOwnerReferences() {
+				if reference.UID == parentObject.GetUID() {
+					res = append(res, item)
+				}
+			}
+		}
+		return res, nil
+	}
+	sort.Slice(itemList.Items, func(i, j int) bool {
+		return itemList.Items[i].GetName() < itemList.Items[j].GetName()
+	})
 	return itemList.Items, nil
 }
 
-func iteratorChildResources(ctx context.Context, cluster string, k8sClient client.Client, parentResource types.ResourceTreeNode, depth int) ([]*types.ResourceTreeNode, error) {
+func iterateListSubResources(ctx context.Context, cluster string, k8sClient client.Client, parentResource types.ResourceTreeNode, depth int, filter func(node types.ResourceTreeNode) bool) ([]*types.ResourceTreeNode, error) {
 	if depth > maxDepth {
-		log.Logger.Warnf("listing application resource tree has reached the max-depth %d parentObject is %v", depth, parentResource)
+		klog.Warningf("listing application resource tree has reached the max-depth %d parentObject is %v", depth, parentResource)
 		return nil, nil
 	}
 	parentObject, err := fetchObjectWithResourceTreeNode(ctx, cluster, k8sClient, parentResource)
@@ -672,19 +948,22 @@ func iteratorChildResources(ctx context.Context, cluster string, k8sClient clien
 	group := parentObject.GetObjectKind().GroupVersionKind().Group
 	kind := parentObject.GetObjectKind().GroupVersionKind().Kind
 
-	if rules, ok := globalRule[GroupResourceType{Group: group, Kind: kind}]; ok {
+	if rule, ok := globalRule.GetRule(GroupResourceType{Group: group, Kind: kind}); ok {
 		var resList []*types.ResourceTreeNode
-		for resource, specifiedFunc := range rules.CareResource {
+		for i := range *rule.SubResources {
+			resource := (*rule.SubResources)[i].ResourceType
+			specifiedFunc := (*rule.SubResources)[i].listOptions
+
 			clusterCTX := multicluster.ContextWithClusterName(ctx, cluster)
-			items, err := listItemByRule(clusterCTX, k8sClient, resource, *parentObject, specifiedFunc, rules.DefaultGenListOptionFunc)
+			items, err := listItemByRule(clusterCTX, k8sClient, resource, *parentObject, specifiedFunc, rule.DefaultGenListOptionFunc, rule.DisableFilterByOwnerReference)
 			if err != nil {
-				if meta.IsNoMatchError(err) || runtime.IsNotRegisteredError(err) {
-					log.Logger.Errorf("error to list subresources: %s err: %v", resource.Kind, err)
+				if meta.IsNoMatchError(err) || runtime.IsNotRegisteredError(err) || kerrors.IsNotFound(err) {
+					klog.Warningf("ignore list resources: %s as %v", resource.Kind, err)
 					continue
 				}
 				return nil, err
 			}
-			for _, item := range items {
+			for i, item := range items {
 				rtn := types.ResourceTreeNode{
 					APIVersion: item.GetAPIVersion(),
 					Kind:       item.GroupVersionKind().Kind,
@@ -692,15 +971,19 @@ func iteratorChildResources(ctx context.Context, cluster string, k8sClient clien
 					Name:       item.GetName(),
 					UID:        item.GetUID(),
 					Cluster:    cluster,
+					Object:     items[i],
 				}
-				if _, ok := globalRule[GroupResourceType{Group: item.GetObjectKind().GroupVersionKind().Group, Kind: item.GetObjectKind().GroupVersionKind().Kind}]; ok {
-					childrenRes, err := iteratorChildResources(ctx, cluster, k8sClient, rtn, depth+1)
+				if _, ok := globalRule.GetRule(GroupResourceType{Group: item.GetObjectKind().GroupVersionKind().Group, Kind: item.GetObjectKind().GroupVersionKind().Kind}); ok {
+					childrenRes, err := iterateListSubResources(ctx, cluster, k8sClient, rtn, depth+1, filter)
 					if err != nil {
 						return nil, err
 					}
 					rtn.LeafNodes = childrenRes
 				}
-				healthStatus, err := checkResourceStatus(item)
+				if !filter(rtn) && len(rtn.LeafNodes) == 0 {
+					continue
+				}
+				healthStatus, err := CheckResourceStatus(item)
 				if err != nil {
 					return nil, err
 				}
@@ -722,35 +1005,60 @@ func iteratorChildResources(ctx context.Context, cluster string, k8sClient clien
 	return nil, nil
 }
 
-// mergeCustomRules merge the customize
+// mergeCustomRules merge user defined resource topology rules with the system ones
 func mergeCustomRules(ctx context.Context, k8sClient client.Client) error {
 	rulesList := v12.ConfigMapList{}
 	if err := k8sClient.List(ctx, &rulesList, client.InNamespace(velatypes.DefaultKubeVelaNS), client.HasLabels{oam.LabelResourceRules}); err != nil {
-		return err
+		return client.IgnoreNotFound(err)
 	}
 	for _, item := range rulesList.Items {
 		ruleStr := item.Data[relationshipKey]
-		var customRules []*customRule
-		err := yaml.Unmarshal([]byte(ruleStr), &customRules)
+		var (
+			customRules []*customRule
+			format      string
+			err         error
+		)
+		if item.Labels != nil {
+			format = item.Labels[oam.LabelResourceRuleFormat]
+		}
+		switch format {
+		case oam.ResourceTopologyFormatJSON:
+			err = json.Unmarshal([]byte(ruleStr), &customRules)
+		case oam.ResourceTopologyFormatYAML, "":
+			err = yaml.Unmarshal([]byte(ruleStr), &customRules)
+		}
 		if err != nil {
 			// don't let one miss-config configmap brake whole process
-			log.Logger.Errorf("relationship rule configamp %s miss config %v", item.Name, err)
+			klog.Errorf("relationship rule configmap %s miss config %v", item.Name, err)
+			continue
 		}
 		for _, rule := range customRules {
-			if cResource, ok := globalRule[*rule.ParentResourceType]; ok {
-				for _, resourceType := range rule.ChildrenResourceType {
-					if _, ok := cResource.CareResource[resourceType]; !ok {
-						cResource.CareResource[resourceType] = nil
+
+			if cResource, ok := globalRule.GetRule(*rule.ParentResourceType); ok {
+				for i, resourceType := range rule.ChildrenResourceType {
+					if cResource.SubResources.Get(resourceType.ResourceType) == nil {
+						cResource.SubResources.Put(buildSubResourceSelector(rule.ChildrenResourceType[i]))
 					}
 				}
 			} else {
-				caredResources := map[ResourceType]genListOptionFunc{}
-				for _, resourceType := range rule.ChildrenResourceType {
-					caredResources[resourceType] = nil
+				var subResources []*SubResourceSelector
+				for i := range rule.ChildrenResourceType {
+					subResources = append(subResources, buildSubResourceSelector(rule.ChildrenResourceType[i]))
 				}
-				globalRule[*rule.ParentResourceType] = ChildrenResourcesRule{DefaultGenListOptionFunc: nil, CareResource: caredResources}
+				globalRule = append(globalRule, ChildrenResourcesRule{
+					GroupResourceType:        *rule.ParentResourceType,
+					DefaultGenListOptionFunc: nil,
+					SubResources:             buildSubResources(subResources)})
 			}
 		}
 	}
 	return nil
+}
+
+func translateTimestampSince(timestamp v1.Time) string {
+	if timestamp.IsZero() {
+		return "<unknown>"
+	}
+
+	return duration.HumanDuration(time.Since(timestamp.Time))
 }

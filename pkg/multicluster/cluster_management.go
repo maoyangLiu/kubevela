@@ -20,9 +20,11 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"strings"
+	"time"
 
 	"github.com/briandowns/spinner"
-	prismclusterv1alpha1 "github.com/kubevela/prism/pkg/apis/cluster/v1alpha1"
+	"github.com/kubevela/pkg/util/k8s"
 	clusterv1alpha1 "github.com/oam-dev/cluster-gateway/pkg/apis/cluster/v1alpha1"
 	clustercommon "github.com/oam-dev/cluster-gateway/pkg/common"
 	"github.com/oam-dev/cluster-register/pkg/hub"
@@ -46,6 +48,12 @@ import (
 	cmdutil "github.com/oam-dev/kubevela/pkg/utils/util"
 )
 
+// ContextKey defines the key in context
+type ContextKey string
+
+// KubeConfigContext marks the kubeConfig object in context
+const KubeConfigContext ContextKey = "kubeConfig"
+
 // KubeClusterConfig info for cluster management
 type KubeClusterConfig struct {
 	FilePath        string
@@ -54,6 +62,10 @@ type KubeClusterConfig struct {
 	*clientcmdapi.Config
 	*clientcmdapi.Cluster
 	*clientcmdapi.AuthInfo
+
+	// ClusterAlreadyExistCallback callback for handling cluster already exist,
+	// if no error returned, the logic will pass through
+	ClusterAlreadyExistCallback func(string) bool
 
 	// Logs records intermediate logs (which do not return error) during running
 	Logs bytes.Buffer
@@ -89,14 +101,25 @@ func (clusterConfig *KubeClusterConfig) PostRegistration(ctx context.Context, cl
 	if clusterConfig.CreateNamespace == "" {
 		return nil
 	}
-	if err := ensureNamespaceExists(ctx, cli, clusterConfig.ClusterName, clusterConfig.CreateNamespace); err != nil {
-		_ = DetachCluster(ctx, cli, clusterConfig.ClusterName, DetachClusterManagedClusterKubeConfigPathOption(clusterConfig.FilePath))
-		return fmt.Errorf("failed to ensure %s namespace installed in cluster %s: %w", clusterConfig.CreateNamespace, clusterConfig.ClusterName, err)
+	// retry 3 times.
+	for i := 0; i < 3; i++ {
+		if err := ensureNamespaceExists(ctx, cli, clusterConfig.ClusterName, clusterConfig.CreateNamespace); err != nil {
+			// Cluster gateway discovers the cluster maybe be deferred, so we should retry.
+			if strings.Contains(err.Error(), "no such cluster") {
+				if i < 2 {
+					time.Sleep(time.Second * 1)
+					continue
+				}
+			}
+			_ = DetachCluster(ctx, cli, clusterConfig.ClusterName, DetachClusterManagedClusterKubeConfigPathOption(clusterConfig.FilePath))
+			return fmt.Errorf("failed to ensure %s namespace installed in cluster %s: %w", clusterConfig.CreateNamespace, clusterConfig.ClusterName, err)
+		}
+		break
 	}
 	return nil
 }
 
-func (clusterConfig *KubeClusterConfig) createClusterSecret(ctx context.Context, cli client.Client, withEndpoint bool) error {
+func (clusterConfig *KubeClusterConfig) createOrUpdateClusterSecret(ctx context.Context, cli client.Client, withEndpoint bool) error {
 	var credentialType clusterv1alpha1.CredentialType
 	data := map[string][]byte{}
 	if withEndpoint {
@@ -113,26 +136,40 @@ func (clusterConfig *KubeClusterConfig) createClusterSecret(ctx context.Context,
 		data["tls.crt"] = clusterConfig.AuthInfo.ClientCertificateData
 		data["tls.key"] = clusterConfig.AuthInfo.ClientKeyData
 	}
-	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      clusterConfig.ClusterName,
-			Namespace: ClusterGatewaySecretNamespace,
-			Labels: map[string]string{
-				clustercommon.LabelKeyClusterCredentialType: string(credentialType),
-			},
-		},
-		Type: corev1.SecretTypeOpaque,
-		Data: data,
+	secret := &corev1.Secret{}
+	if err := cli.Get(ctx, apitypes.NamespacedName{Name: clusterConfig.ClusterName, Namespace: ClusterGatewaySecretNamespace}, secret); client.IgnoreNotFound(err) != nil {
+		return err
 	}
-	return cli.Create(ctx, secret)
+	secret.Name = clusterConfig.ClusterName
+	secret.Namespace = ClusterGatewaySecretNamespace
+	secret.Type = corev1.SecretTypeOpaque
+	_ = k8s.AddLabel(secret, clustercommon.LabelKeyClusterCredentialType, string(credentialType))
+	secret.Data = data
+	if secret.ResourceVersion == "" {
+		return cli.Create(ctx, secret)
+	}
+	return cli.Update(ctx, secret)
 }
 
 // RegisterByVelaSecret create cluster secrets for KubeVela to use
 func (clusterConfig *KubeClusterConfig) RegisterByVelaSecret(ctx context.Context, cli client.Client) error {
-	if err := ensureClusterNotExists(ctx, cli, clusterConfig.ClusterName); err != nil {
-		return errors.Wrapf(err, "cannot use cluster name %s", clusterConfig.ClusterName)
+	cluster, err := NewClusterClient(cli).Get(ctx, clusterConfig.ClusterName)
+	if client.IgnoreNotFound(err) != nil {
+		return err
 	}
-	if err := clusterConfig.createClusterSecret(ctx, cli, true); err != nil {
+	if cluster != nil {
+		if clusterConfig.ClusterAlreadyExistCallback == nil {
+			return fmt.Errorf("cluster %s already exists", cluster.Name)
+		}
+		if !clusterConfig.ClusterAlreadyExistCallback(clusterConfig.ClusterName) {
+			return nil
+		}
+		if cluster.Spec.CredentialType == clusterv1alpha1.CredentialTypeInternal || cluster.Spec.CredentialType == clusterv1alpha1.CredentialTypeOCMManagedCluster {
+			return fmt.Errorf("cannot override %s typed cluster", cluster.Spec.CredentialType)
+		}
+	}
+
+	if err := clusterConfig.createOrUpdateClusterSecret(ctx, cli, true); err != nil {
 		return errors.Wrapf(err, "failed to add cluster to kubernetes")
 	}
 	return clusterConfig.PostRegistration(ctx, cli)
@@ -311,12 +348,13 @@ const (
 
 // JoinClusterArgs args for join cluster
 type JoinClusterArgs struct {
-	engine                 string
-	createNamespace        string
-	ioStreams              cmdutil.IOStreams
-	hubConfig              *rest.Config
-	inClusterBootstrap     *bool
-	trackingSpinnerFactory func(string) *spinner.Spinner
+	engine                      string
+	createNamespace             string
+	ioStreams                   cmdutil.IOStreams
+	hubConfig                   *rest.Config
+	inClusterBootstrap          *bool
+	trackingSpinnerFactory      func(string) *spinner.Spinner
+	clusterAlreadyExistCallback func(string) bool
 }
 
 func newJoinClusterArgs(options ...JoinClusterOption) *JoinClusterArgs {
@@ -350,6 +388,14 @@ func (op JoinClusterEngineOption) ApplyToArgs(args *JoinClusterArgs) {
 	args.engine = string(op)
 }
 
+// JoinClusterAlreadyExistCallback configure the callback when cluster already exist
+type JoinClusterAlreadyExistCallback func(string) bool
+
+// ApplyToArgs apply to args
+func (op JoinClusterAlreadyExistCallback) ApplyToArgs(args *JoinClusterArgs) {
+	args.clusterAlreadyExistCallback = op
+}
+
 // JoinClusterOCMOptions options used when joining clusters by ocm, only support cli for now
 type JoinClusterOCMOptions struct {
 	IoStreams              cmdutil.IOStreams
@@ -376,6 +422,7 @@ func JoinClusterByKubeConfig(ctx context.Context, cli client.Client, kubeconfigP
 	if err := clusterConfig.SetClusterName(clusterName).SetCreateNamespace(args.createNamespace).Validate(); err != nil {
 		return nil, err
 	}
+	clusterConfig.ClusterAlreadyExistCallback = args.clusterAlreadyExistCallback
 	switch args.engine {
 	case ClusterGateWayEngine:
 		if err = clusterConfig.RegisterByVelaSecret(ctx, cli); err != nil {
@@ -388,6 +435,11 @@ func JoinClusterByKubeConfig(ctx context.Context, cli client.Client, kubeconfigP
 		}
 		if err = clusterConfig.RegisterClusterManagedByOCM(ctx, cli, args); err != nil {
 			return clusterConfig, err
+		}
+	}
+	if cfg, ok := ctx.Value(KubeConfigContext).(*rest.Config); ok {
+		if err = SetClusterVersionInfo(ctx, cfg, clusterConfig.ClusterName); err != nil {
+			return nil, err
 		}
 	}
 	return clusterConfig, nil
@@ -425,7 +477,7 @@ func DetachCluster(ctx context.Context, cli client.Client, clusterName string, o
 	if clusterName == ClusterLocalName {
 		return ErrReservedLocalClusterName
 	}
-	vc, err := prismclusterv1alpha1.NewClusterClient(cli).Get(ctx, clusterName)
+	vc, err := NewClusterClient(cli).Get(ctx, clusterName)
 	if err != nil {
 		return err
 	}
@@ -439,7 +491,7 @@ func DetachCluster(ctx context.Context, cli client.Client, clusterName string, o
 		if err := cli.Delete(ctx, clusterSecret); err != nil {
 			return errors.Wrapf(err, "failed to detach cluster %s", clusterName)
 		}
-	case prismclusterv1alpha1.CredentialTypeOCMManagedCluster:
+	case clusterv1alpha1.CredentialTypeOCMManagedCluster:
 		if args.managedClusterKubeConfigPath == "" {
 			return errors.New("kubeconfig-path must be set to detach ocm managed cluster")
 		}
@@ -462,6 +514,8 @@ func DetachCluster(ctx context.Context, cli client.Client, clusterName string, o
 				return err
 			}
 		}
+	case clusterv1alpha1.CredentialTypeInternal:
+		return fmt.Errorf("cannot detach internal cluster `local`")
 	}
 	return nil
 }
@@ -508,12 +562,9 @@ func AliasCluster(ctx context.Context, cli client.Client, clusterName string, al
 
 // ensureClusterNotExists will check the cluster is not existed in control plane
 func ensureClusterNotExists(ctx context.Context, c client.Client, clusterName string) error {
-	_, err := GetVirtualCluster(ctx, c, clusterName)
+	_, err := NewClusterClient(c).Get(ctx, clusterName)
 	if err != nil {
-		if IsClusterNotExists(err) {
-			return nil
-		}
-		return err
+		return client.IgnoreNotFound(err)
 	}
 	return ErrClusterExists
 }

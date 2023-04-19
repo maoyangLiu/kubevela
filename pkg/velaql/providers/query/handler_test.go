@@ -18,31 +18,34 @@ package query
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
+	"os"
 	"time"
 
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 	v1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	networkv1beta1 "k8s.io/api/networking/v1beta1"
+	networkv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/intstr"
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/yaml"
+
+	monitorContext "github.com/kubevela/pkg/monitor/context"
+	"github.com/kubevela/workflow/pkg/cue/model/value"
+	"github.com/kubevela/workflow/pkg/providers"
 
 	"github.com/oam-dev/kubevela/apis/core.oam.dev/common"
 	"github.com/oam-dev/kubevela/apis/core.oam.dev/v1beta1"
 	helmapi "github.com/oam-dev/kubevela/pkg/appfile/helm/flux2apis"
-	"github.com/oam-dev/kubevela/pkg/cue/model/value"
 	"github.com/oam-dev/kubevela/pkg/oam"
 	"github.com/oam-dev/kubevela/pkg/oam/util"
+	verrors "github.com/oam-dev/kubevela/pkg/utils/errors"
 	querytypes "github.com/oam-dev/kubevela/pkg/velaql/providers/query/types"
-	"github.com/oam-dev/kubevela/pkg/workflow/providers"
 )
 
 type AppResourcesList struct {
@@ -215,7 +218,8 @@ var _ = Describe("Test Query Provider", func() {
 			}`
 			v, err := value.NewValue(opt, nil, "")
 			Expect(err).Should(BeNil())
-			Expect(prd.ListResourcesInApp(nil, v, nil)).Should(BeNil())
+			logCtx := monitorContext.NewTraceContext(ctx, "")
+			Expect(prd.ListResourcesInApp(logCtx, nil, v, nil)).Should(BeNil())
 
 			appResList := new(AppResourcesList)
 			Expect(v.UnmarshalTo(appResList)).Should(BeNil())
@@ -237,7 +241,7 @@ var _ = Describe("Test Query Provider", func() {
 			Expect(k8sClient.Update(ctx, updateApp)).Should(BeNil())
 			newValue, err := value.NewValue(opt, nil, "")
 			Expect(err).Should(BeNil())
-			Expect(prd.ListResourcesInApp(nil, newValue, nil)).Should(BeNil())
+			Expect(prd.ListResourcesInApp(logCtx, nil, newValue, nil)).Should(BeNil())
 			newAppResList := new(AppResourcesList)
 			Expect(v.UnmarshalTo(newAppResList)).Should(BeNil())
 			Expect(len(newAppResList.List)).Should(Equal(2))
@@ -250,9 +254,10 @@ var _ = Describe("Test Query Provider", func() {
 			prd := provider{cli: k8sClient}
 			newV, err := value.NewValue(optWithoutApp, nil, "")
 			Expect(err).Should(BeNil())
-			err = prd.ListResourcesInApp(nil, newV, nil)
+			logCtx := monitorContext.NewTraceContext(ctx, "")
+			err = prd.ListResourcesInApp(logCtx, nil, newV, nil)
 			Expect(err).ShouldNot(BeNil())
-			Expect(err.Error()).Should(Equal("var(path=app) not exist"))
+			Expect(verrors.IsCuePathNotFound(err)).Should(BeTrue())
 		})
 	})
 
@@ -338,7 +343,8 @@ var _ = Describe("Test Query Provider", func() {
 			}`
 			v, err := value.NewValue(opt, nil, "")
 			Expect(err).Should(BeNil())
-			Expect(prd.ListAppliedResources(nil, v, nil)).Should(BeNil())
+			logCtx := monitorContext.NewTraceContext(ctx, "")
+			Expect(prd.ListAppliedResources(logCtx, nil, v, nil)).Should(BeNil())
 			type Res struct {
 				List []v1beta1.ManagedResource `json:"list"`
 			}
@@ -358,7 +364,7 @@ var _ = Describe("Test Query Provider", func() {
 			}`
 			valueWithVersion, err := value.NewValue(optWithVersion, nil, "")
 			Expect(err).Should(BeNil())
-			Expect(prd.ListAppliedResources(nil, valueWithVersion, nil)).Should(BeNil())
+			Expect(prd.ListAppliedResources(logCtx, nil, valueWithVersion, nil)).Should(BeNil())
 			var res2 Res
 			err = valueWithVersion.UnmarshalTo(&res2)
 			Expect(err).Should(BeNil())
@@ -375,86 +381,12 @@ var _ = Describe("Test Query Provider", func() {
 			}`
 			valueWithKind, err := value.NewValue(optWithKind, nil, "")
 			Expect(err).Should(BeNil())
-			Expect(prd.ListAppliedResources(nil, valueWithKind, nil)).Should(BeNil())
+			Expect(prd.ListAppliedResources(logCtx, nil, valueWithKind, nil)).Should(BeNil())
 			var res3 Res
 			err = valueWithKind.UnmarshalTo(&res3)
 			Expect(err).Should(BeNil())
 			Expect(len(res3.List)).Should(Equal(1))
 			Expect(res3.List[0].Kind).Should(Equal("Service"))
-		})
-	})
-
-	Context("Test CollectPods", func() {
-		It("Test collect pod from workload deployment", func() {
-			deploy := baseDeploy.DeepCopy()
-			deploy.SetName("test-collect-pod")
-			deploy.Spec.Selector = &metav1.LabelSelector{
-				MatchLabels: map[string]string{
-					oam.LabelAppComponent: "test",
-				},
-			}
-			deploy.Spec.Template.ObjectMeta.SetLabels(map[string]string{
-				oam.LabelAppComponent: "test",
-			})
-			Expect(k8sClient.Create(ctx, deploy)).Should(BeNil())
-			for i := 1; i <= 5; i++ {
-				pod := basePod.DeepCopy()
-				pod.SetName(fmt.Sprintf("test-collect-pod-%d", i))
-				pod.SetLabels(map[string]string{
-					oam.LabelAppComponent: "test",
-				})
-				Expect(k8sClient.Create(ctx, pod)).Should(BeNil())
-			}
-
-			prd := provider{cli: k8sClient}
-			unstructuredDeploy, err := util.Object2Unstructured(deploy)
-			Expect(err).Should(BeNil())
-			unstructuredDeploy.SetGroupVersionKind((&corev1.ObjectReference{
-				APIVersion: "apps/v1",
-				Kind:       "Deployment",
-			}).GroupVersionKind())
-
-			deployJson, err := json.Marshal(unstructuredDeploy)
-			Expect(err).Should(BeNil())
-			opt := fmt.Sprintf(`value: %s
-cluster: ""`, deployJson)
-			v, err := value.NewValue(opt, nil, "")
-			Expect(err).Should(BeNil())
-			Expect(prd.CollectPods(nil, v, nil)).Should(BeNil())
-
-			podList := new(PodList)
-			Expect(v.UnmarshalTo(podList)).Should(BeNil())
-			Expect(len(podList.List)).Should(Equal(5))
-			for _, pod := range podList.List {
-				Expect(pod.GroupVersionKind()).Should(Equal((&corev1.ObjectReference{
-					APIVersion: "v1",
-					Kind:       "Pod",
-				}).GroupVersionKind()))
-			}
-		})
-
-		It("Test collect pod with incomplete parameter", func() {
-			emptyOpt := ""
-			prd := provider{cli: k8sClient}
-			v, err := value.NewValue(emptyOpt, nil, "")
-			Expect(err).Should(BeNil())
-			err = prd.CollectPods(nil, v, nil)
-			Expect(err).ShouldNot(BeNil())
-			Expect(err.Error()).Should(Equal("var(path=value) not exist"))
-
-			optWithoutCluster := `value: {}`
-			v, err = value.NewValue(optWithoutCluster, nil, "")
-			Expect(err).Should(BeNil())
-			err = prd.CollectPods(nil, v, nil)
-			Expect(err).ShouldNot(BeNil())
-			Expect(err.Error()).Should(Equal("var(path=cluster) not exist"))
-
-			optWithWrongValue := `value: {test: 1}
-cluster: "test"`
-			v, err = value.NewValue(optWithWrongValue, nil, "")
-			Expect(err).Should(BeNil())
-			err = prd.CollectPods(nil, v, nil)
-			Expect(err).ShouldNot(BeNil())
 		})
 	})
 
@@ -464,22 +396,23 @@ cluster: "test"`
 			prd := provider{cli: k8sClient}
 			v, err := value.NewValue(emptyOpt, nil, "")
 			Expect(err).Should(BeNil())
-			err = prd.SearchEvents(nil, v, nil)
+			logCtx := monitorContext.NewTraceContext(ctx, "")
+			err = prd.SearchEvents(logCtx, nil, v, nil)
 			Expect(err).ShouldNot(BeNil())
-			Expect(err.Error()).Should(Equal("var(path=value) not exist"))
+			Expect(verrors.IsCuePathNotFound(err)).Should(BeTrue())
 
 			optWithoutCluster := `value: {}`
 			v, err = value.NewValue(optWithoutCluster, nil, "")
 			Expect(err).Should(BeNil())
-			err = prd.SearchEvents(nil, v, nil)
+			err = prd.SearchEvents(logCtx, nil, v, nil)
 			Expect(err).ShouldNot(BeNil())
-			Expect(err.Error()).Should(Equal("var(path=cluster) not exist"))
+			Expect(verrors.IsCuePathNotFound(err)).Should(BeTrue())
 
 			optWithWrongValue := `value: {}
 cluster: "test"`
 			v, err = value.NewValue(optWithWrongValue, nil, "")
 			Expect(err).Should(BeNil())
-			err = prd.SearchEvents(nil, v, nil)
+			err = prd.SearchEvents(logCtx, nil, v, nil)
 			Expect(err).ShouldNot(BeNil())
 		})
 	})
@@ -493,33 +426,34 @@ cluster: "test"`
 					Containers: []corev1.Container{{Name: "main", Image: "busybox"}},
 				}}
 			Expect(k8sClient.Create(ctx, pod)).Should(Succeed())
+			logCtx := monitorContext.NewTraceContext(ctx, "")
 
 			v, err := value.NewValue(``, nil, "")
 			Expect(err).Should(Succeed())
-			err = prd.CollectLogsInPod(nil, v, nil)
+			err = prd.CollectLogsInPod(logCtx, nil, v, nil)
 			Expect(err).ShouldNot(BeNil())
-			Expect(err.Error()).Should(ContainSubstring("var(path=cluster) not exist"))
+			Expect(verrors.IsCuePathNotFound(err)).Should(BeTrue())
 
 			v, err = value.NewValue(`cluster: "local"`, nil, "")
 			Expect(err).Should(Succeed())
-			err = prd.CollectLogsInPod(nil, v, nil)
+			err = prd.CollectLogsInPod(logCtx, nil, v, nil)
 			Expect(err).ShouldNot(BeNil())
-			Expect(err.Error()).Should(ContainSubstring("var(path=namespace) not exist"))
+			Expect(verrors.IsCuePathNotFound(err)).Should(BeTrue())
 
 			v, err = value.NewValue(`cluster: "local"
 namespace: "default"`, nil, "")
 			Expect(err).Should(Succeed())
-			err = prd.CollectLogsInPod(nil, v, nil)
+			err = prd.CollectLogsInPod(logCtx, nil, v, nil)
 			Expect(err).ShouldNot(BeNil())
-			Expect(err.Error()).Should(ContainSubstring("var(path=pod) not exist"))
+			Expect(verrors.IsCuePathNotFound(err)).Should(BeTrue())
 
 			v, err = value.NewValue(`cluster: "local"
 namespace: "default"
 pod: "hello-world"`, nil, "")
 			Expect(err).Should(Succeed())
-			err = prd.CollectLogsInPod(nil, v, nil)
+			err = prd.CollectLogsInPod(logCtx, nil, v, nil)
 			Expect(err).ShouldNot(BeNil())
-			Expect(err.Error()).Should(ContainSubstring("var(path=options) not exist"))
+			Expect(verrors.IsCuePathNotFound(err)).Should(BeTrue())
 
 			v, err = value.NewValue(`cluster: "local"
 namespace: "default"
@@ -528,7 +462,7 @@ options: {
   container: 1
 }`, nil, "")
 			Expect(err).Should(Succeed())
-			err = prd.CollectLogsInPod(nil, v, nil)
+			err = prd.CollectLogsInPod(logCtx, nil, v, nil)
 			Expect(err).ShouldNot(BeNil())
 			Expect(err.Error()).Should(ContainSubstring("invalid log options content"))
 
@@ -542,7 +476,7 @@ options: {
   tailLines: 50
 }`, nil, "")
 			Expect(err).Should(Succeed())
-			Expect(prd.CollectLogsInPod(nil, v, nil)).Should(Succeed())
+			Expect(prd.CollectLogsInPod(logCtx, nil, v, nil)).Should(Succeed())
 			_, err = v.GetString("outputs", "logs")
 			Expect(err).Should(Succeed())
 		})
@@ -554,8 +488,11 @@ options: {
 		h, ok := p.GetHandler("query", "listResourcesInApp")
 		Expect(h).ShouldNot(BeNil())
 		Expect(ok).Should(Equal(true))
-		h, ok = p.GetHandler("query", "collectPods")
+		h, ok = p.GetHandler("query", "collectResources")
 		Expect(h).ShouldNot(BeNil())
+		Expect(ok).Should(Equal(true))
+		l, ok := p.GetHandler("query", "listAppliedResources")
+		Expect(l).ShouldNot(BeNil())
 		Expect(ok).Should(Equal(true))
 		h, ok = p.GetHandler("query", "searchEvents")
 		Expect(ok).Should(Equal(true))
@@ -569,6 +506,91 @@ options: {
 	})
 
 	It("Test generator service endpoints", func() {
+		appsts := common.AppStatus{
+			AppliedResources: []common.ClusterObjectReference{
+				{
+					Cluster: "",
+					ObjectReference: corev1.ObjectReference{
+						Kind:       "Ingress",
+						Namespace:  "default",
+						Name:       "ingress-http",
+						APIVersion: "networking.k8s.io/v1beta1",
+					},
+				},
+				{
+					Cluster: "",
+					ObjectReference: corev1.ObjectReference{
+						Kind:       "Ingress",
+						Namespace:  "default",
+						Name:       "ingress-https",
+						APIVersion: "networking.k8s.io/v1beta1",
+					},
+				},
+				{
+					Cluster: "",
+					ObjectReference: corev1.ObjectReference{
+						Kind:       "Ingress",
+						Namespace:  "default",
+						Name:       "ingress-paths",
+						APIVersion: "networking.k8s.io/v1beta1",
+					},
+				},
+				{
+					Cluster: "",
+					ObjectReference: corev1.ObjectReference{
+						APIVersion: "v1",
+						Kind:       "Service",
+						Namespace:  "default",
+						Name:       "nodeport",
+					},
+				},
+				{
+					Cluster: "",
+					ObjectReference: corev1.ObjectReference{
+						APIVersion: "v1",
+						Kind:       "Service",
+						Namespace:  "default",
+						Name:       "loadbalancer",
+					},
+				},
+				{
+					Cluster: "",
+					ObjectReference: corev1.ObjectReference{
+						APIVersion: "helm.toolkit.fluxcd.io/v2beta1",
+						Kind:       helmapi.HelmReleaseGVK.Kind,
+						Namespace:  "default",
+						Name:       "helm-release",
+					},
+				},
+				{
+					Cluster: "",
+					ObjectReference: corev1.ObjectReference{
+						APIVersion: "machinelearning.seldon.io/v1",
+						Kind:       "SeldonDeployment",
+						Namespace:  "default",
+						Name:       "sdep",
+					},
+				},
+				{
+					Cluster: "",
+					ObjectReference: corev1.ObjectReference{
+						APIVersion: "gateway.networking.k8s.io/v1alpha2",
+						Kind:       "HTTPRoute",
+						Namespace:  "default",
+						Name:       "http-test-route",
+					},
+				},
+				{
+					Cluster: "",
+					ObjectReference: corev1.ObjectReference{
+						APIVersion: "gateway.networking.k8s.io/v1alpha2",
+						Kind:       "HTTPRoute",
+						Namespace:  "default",
+						Name:       "velaux-ssl",
+					},
+				},
+			},
+		}
 		testApp := &v1beta1.Application{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "endpoints-app",
@@ -582,77 +604,22 @@ options: {
 					},
 				},
 			},
-			Status: common.AppStatus{
-				AppliedResources: []common.ClusterObjectReference{
-					{
-						Cluster: "",
-						ObjectReference: corev1.ObjectReference{
-							Kind:       "Ingress",
-							Namespace:  "default",
-							Name:       "ingress-http",
-							APIVersion: "networking.k8s.io/v1beta1",
-						},
-					},
-					{
-						Cluster: "",
-						ObjectReference: corev1.ObjectReference{
-							Kind:       "Ingress",
-							Namespace:  "default",
-							Name:       "ingress-https",
-							APIVersion: "networking.k8s.io/v1",
-						},
-					},
-					{
-						Cluster: "",
-						ObjectReference: corev1.ObjectReference{
-							Kind:       "Ingress",
-							Namespace:  "default",
-							Name:       "ingress-paths",
-							APIVersion: "networking.k8s.io/v1",
-						},
-					},
-					{
-						Cluster: "",
-						ObjectReference: corev1.ObjectReference{
-							Kind:      "Service",
-							Namespace: "default",
-							Name:      "nodeport",
-						},
-					},
-					{
-						Cluster: "",
-						ObjectReference: corev1.ObjectReference{
-							Kind:      "Service",
-							Namespace: "default",
-							Name:      "loadbalancer",
-						},
-					},
-					{
-						Cluster: "",
-						ObjectReference: corev1.ObjectReference{
-							Kind:      helmapi.HelmReleaseGVK.Kind,
-							Namespace: "default",
-							Name:      "helmRelease",
-						},
-					},
-					{
-						Cluster: "",
-						ObjectReference: corev1.ObjectReference{
-							Kind:      "SeldonDeployment",
-							Namespace: "default",
-							Name:      "sdep",
-						},
-					},
-				},
-			},
+			Status: appsts,
 		}
 		err := k8sClient.Create(context.TODO(), testApp)
 		Expect(err).Should(BeNil())
+
+		var gtapp v1beta1.Application
+		Expect(k8sClient.Get(context.TODO(), client.ObjectKey{Name: "endpoints-app", Namespace: "default"}, &gtapp)).Should(BeNil())
+		gtapp.Status = appsts
+		Expect(k8sClient.Status().Update(ctx, &gtapp)).Should(BeNil())
 		var mr []v1beta1.ManagedResource
-		for i := range testApp.Status.AppliedResources {
-			mr = append(mr, v1beta1.ManagedResource{
-				ClusterObjectReference: testApp.Status.AppliedResources[i],
-			})
+		for _, ar := range appsts.AppliedResources {
+			smr := v1beta1.ManagedResource{
+				ClusterObjectReference: ar,
+			}
+			smr.Component = "endpoints-test"
+			mr = append(mr, smr)
 		}
 		rt := &v1beta1.ResourceTracker{
 			ObjectMeta: metav1.ObjectMeta{
@@ -671,7 +638,14 @@ options: {
 		err = k8sClient.Create(context.TODO(), rt)
 		Expect(err).Should(BeNil())
 
-		testServicelist := []map[string]interface{}{
+		helmRelease := &unstructured.Unstructured{}
+		helmRelease.SetName("helm-release")
+		helmRelease.SetNamespace("default")
+		helmRelease.SetGroupVersionKind(helmapi.HelmReleaseGVK)
+		err = k8sClient.Create(context.TODO(), helmRelease)
+		Expect(err).Should(BeNil())
+
+		testServiceList := []map[string]interface{}{
 			{
 				"name": "clusterip",
 				"ports": []corev1.ServicePort{
@@ -690,8 +664,8 @@ options: {
 			{
 				"name": "loadbalancer",
 				"ports": []corev1.ServicePort{
-					{Port: 80, TargetPort: intstr.FromInt(80), Name: "80port"},
-					{Port: 81, TargetPort: intstr.FromInt(81), Name: "81port"},
+					{Port: 80, TargetPort: intstr.FromInt(80), Name: "80port", NodePort: 30080},
+					{Port: 81, TargetPort: intstr.FromInt(81), Name: "81port", NodePort: 30081},
 				},
 				"type": corev1.ServiceTypeLoadBalancer,
 				"status": corev1.ServiceStatus{
@@ -714,14 +688,14 @@ options: {
 				},
 				"type": corev1.ServiceTypeNodePort,
 				"labels": map[string]string{
-					"helm.toolkit.fluxcd.io/name":      "helmRelease",
+					"helm.toolkit.fluxcd.io/name":      "helm-release",
 					"helm.toolkit.fluxcd.io/namespace": "default",
 				},
 			},
 			{
 				"name": "seldon-ambassador",
 				"ports": []corev1.ServicePort{
-					{Port: 80, TargetPort: intstr.FromInt(80), Name: "80port"},
+					{Port: 80, TargetPort: intstr.FromInt(80), Name: "80port", NodePort: 30011},
 				},
 				"type": corev1.ServiceTypeLoadBalancer,
 				"status": corev1.ServiceStatus{
@@ -741,7 +715,7 @@ options: {
 			},
 		})
 		Expect(err).Should(SatisfyAny(BeNil(), util.AlreadyExistMatcher{}))
-		for _, s := range testServicelist {
+		for _, s := range testServiceList {
 			ns := "default"
 			if s["namespace"] != nil {
 				ns = s["namespace"].(string)
@@ -768,25 +742,30 @@ options: {
 				Expect(err).Should(BeNil())
 			}
 		}
-		var prefixbeta = networkv1beta1.PathTypePrefix
+
+		var prefixbeta = networkv1.PathTypePrefix
 		testIngress := []client.Object{
-			&networkv1beta1.Ingress{
+			&networkv1.Ingress{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "ingress-http",
 					Namespace: "default",
 				},
-				Spec: networkv1beta1.IngressSpec{
-					Rules: []networkv1beta1.IngressRule{
+				Spec: networkv1.IngressSpec{
+					Rules: []networkv1.IngressRule{
 						{
 							Host: "ingress.domain",
-							IngressRuleValue: networkv1beta1.IngressRuleValue{
-								HTTP: &networkv1beta1.HTTPIngressRuleValue{
-									Paths: []networkv1beta1.HTTPIngressPath{
+							IngressRuleValue: networkv1.IngressRuleValue{
+								HTTP: &networkv1.HTTPIngressRuleValue{
+									Paths: []networkv1.HTTPIngressPath{
 										{
 											Path: "/",
-											Backend: networkv1beta1.IngressBackend{
-												ServiceName: "clusterip",
-												ServicePort: intstr.FromInt(80),
+											Backend: networkv1.IngressBackend{
+												Service: &networkv1.IngressServiceBackend{
+													Name: "clusterip",
+													Port: networkv1.ServiceBackendPort{
+														Number: 80,
+													},
+												},
 											},
 											PathType: &prefixbeta,
 										},
@@ -797,28 +776,32 @@ options: {
 					},
 				},
 			},
-			&networkv1beta1.Ingress{
+			&networkv1.Ingress{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "ingress-https",
 					Namespace: "default",
 				},
-				Spec: networkv1beta1.IngressSpec{
-					TLS: []networkv1beta1.IngressTLS{
+				Spec: networkv1.IngressSpec{
+					TLS: []networkv1.IngressTLS{
 						{
 							SecretName: "https-secret",
 						},
 					},
-					Rules: []networkv1beta1.IngressRule{
+					Rules: []networkv1.IngressRule{
 						{
 							Host: "ingress.domain.https",
-							IngressRuleValue: networkv1beta1.IngressRuleValue{
-								HTTP: &networkv1beta1.HTTPIngressRuleValue{
-									Paths: []networkv1beta1.HTTPIngressPath{
+							IngressRuleValue: networkv1.IngressRuleValue{
+								HTTP: &networkv1.HTTPIngressRuleValue{
+									Paths: []networkv1.HTTPIngressPath{
 										{
 											Path: "/",
-											Backend: networkv1beta1.IngressBackend{
-												ServiceName: "clusterip",
-												ServicePort: intstr.FromInt(80),
+											Backend: networkv1.IngressBackend{
+												Service: &networkv1.IngressServiceBackend{
+													Name: "clusterip",
+													Port: networkv1.ServiceBackendPort{
+														Number: 80,
+													},
+												},
 											},
 											PathType: &prefixbeta,
 										},
@@ -829,36 +812,44 @@ options: {
 					},
 				},
 			},
-			&networkv1beta1.Ingress{
+			&networkv1.Ingress{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "ingress-paths",
 					Namespace: "default",
 				},
-				Spec: networkv1beta1.IngressSpec{
-					TLS: []networkv1beta1.IngressTLS{
+				Spec: networkv1.IngressSpec{
+					TLS: []networkv1.IngressTLS{
 						{
 							SecretName: "https-secret",
 						},
 					},
-					Rules: []networkv1beta1.IngressRule{
+					Rules: []networkv1.IngressRule{
 						{
 							Host: "ingress.domain.path",
-							IngressRuleValue: networkv1beta1.IngressRuleValue{
-								HTTP: &networkv1beta1.HTTPIngressRuleValue{
-									Paths: []networkv1beta1.HTTPIngressPath{
+							IngressRuleValue: networkv1.IngressRuleValue{
+								HTTP: &networkv1.HTTPIngressRuleValue{
+									Paths: []networkv1.HTTPIngressPath{
 										{
 											Path: "/test",
-											Backend: networkv1beta1.IngressBackend{
-												ServiceName: "clusterip",
-												ServicePort: intstr.FromInt(80),
+											Backend: networkv1.IngressBackend{
+												Service: &networkv1.IngressServiceBackend{
+													Name: "clusterip",
+													Port: networkv1.ServiceBackendPort{
+														Number: 80,
+													},
+												},
 											},
 											PathType: &prefixbeta,
 										},
 										{
 											Path: "/test2",
-											Backend: networkv1beta1.IngressBackend{
-												ServiceName: "clusterip",
-												ServicePort: intstr.FromInt(80),
+											Backend: networkv1.IngressBackend{
+												Service: &networkv1.IngressServiceBackend{
+													Name: "clusterip",
+													Port: networkv1.ServiceBackendPort{
+														Number: 80,
+													},
+												},
 											},
 											PathType: &prefixbeta,
 										},
@@ -869,7 +860,7 @@ options: {
 					},
 				},
 			},
-			&networkv1beta1.Ingress{
+			&networkv1.Ingress{
 				TypeMeta: metav1.TypeMeta{
 					APIVersion: "networking.k8s.io/v1beta1",
 				},
@@ -877,22 +868,26 @@ options: {
 					Name:      "ingress-helm",
 					Namespace: "default",
 					Labels: map[string]string{
-						"helm.toolkit.fluxcd.io/name":      "helmRelease",
+						"helm.toolkit.fluxcd.io/name":      "helm-release",
 						"helm.toolkit.fluxcd.io/namespace": "default",
 					},
 				},
-				Spec: networkv1beta1.IngressSpec{
-					Rules: []networkv1beta1.IngressRule{
+				Spec: networkv1.IngressSpec{
+					Rules: []networkv1.IngressRule{
 						{
 							Host: "ingress.domain.helm",
-							IngressRuleValue: networkv1beta1.IngressRuleValue{
-								HTTP: &networkv1beta1.HTTPIngressRuleValue{
-									Paths: []networkv1beta1.HTTPIngressPath{
+							IngressRuleValue: networkv1.IngressRuleValue{
+								HTTP: &networkv1.HTTPIngressRuleValue{
+									Paths: []networkv1.HTTPIngressPath{
 										{
 											Path: "/",
-											Backend: networkv1beta1.IngressBackend{
-												ServiceName: "clusterip",
-												ServicePort: intstr.FromInt(80),
+											Backend: networkv1.IngressBackend{
+												Service: &networkv1.IngressServiceBackend{
+													Name: "clusterip",
+													Port: networkv1.ServiceBackendPort{
+														Number: 80,
+													},
+												},
 											},
 											PathType: &prefixbeta,
 										},
@@ -925,6 +920,68 @@ options: {
 		err = k8sClient.Create(context.TODO(), obj)
 		Expect(err).Should(BeNil())
 
+		// Create the HTTPRoute for test
+		resources := []string{
+			"./testdata/gateway/http-route.yaml",
+			"./testdata/gateway/gateway.yaml",
+			"./testdata/gateway/gateway-tls.yaml",
+			"./testdata/gateway/https-route.yaml",
+		}
+		var objects []client.Object
+		for _, resource := range resources {
+			data, err := os.ReadFile(resource)
+			Expect(err).Should(BeNil())
+			var route unstructured.Unstructured
+			err = yaml.Unmarshal(data, &route)
+			Expect(err).Should(BeNil())
+			objects = append(objects, &route)
+		}
+
+		for _, res := range objects {
+			err := k8sClient.Create(context.TODO(), res)
+			Expect(err).Should(BeNil())
+		}
+
+		// Prepare nodes in test environment
+		masterNode := &corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "node-1",
+				Labels: map[string]string{
+					"node-role.kubernetes.io/master": "true",
+				},
+			},
+			Status: corev1.NodeStatus{
+				Addresses: []corev1.NodeAddress{
+					{
+						Type:    corev1.NodeInternalIP,
+						Address: "internal-ip-1",
+					},
+				},
+			},
+		}
+		workerNode := &corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "node-2",
+				Labels: map[string]string{
+					"node-role.kubernetes.io/worker": "true",
+				},
+			},
+			Status: corev1.NodeStatus{
+				Addresses: []corev1.NodeAddress{
+					{
+						Type:    corev1.NodeInternalIP,
+						Address: "internal-ip-2",
+					},
+					{
+						Type:    corev1.NodeExternalIP,
+						Address: "external-ip-2",
+					},
+				},
+			},
+		}
+		Expect(k8sClient.Create(ctx, masterNode)).Should(BeNil())
+		Expect(k8sClient.Create(ctx, workerNode)).Should(BeNil())
+
 		opt := `app: {
 			name: "endpoints-app"
 			namespace: "default"
@@ -932,26 +989,18 @@ options: {
 				cluster: "",
 				clusterNamespace: "default",
 			}
+			withTree: true
 		}`
 		v, err := value.NewValue(opt, nil, "")
 		Expect(err).Should(BeNil())
 		pr := &provider{
 			cli: k8sClient,
 		}
-		err = pr.GeneratorServiceEndpoints(nil, v, nil)
+		logCtx := monitorContext.NewTraceContext(ctx, "")
+		err = pr.CollectServiceEndpoints(logCtx, nil, v, nil)
 		Expect(err).Should(BeNil())
-		var node corev1.NodeList
-		err = k8sClient.List(context.TODO(), &node)
-		Expect(err).Should(BeNil())
-		var gatewayIP string
-		if len(node.Items) > 0 {
-			for _, address := range node.Items[0].Status.Addresses {
-				if address.Type == corev1.NodeInternalIP {
-					gatewayIP = address.Address
-					break
-				}
-			}
-		}
+		gatewayIP := selectorNodeIP(ctx, "", k8sClient)
+		Expect(gatewayIP).Should(Equal("external-ip-2"))
 		urls := []string{
 			"http://ingress.domain",
 			"https://ingress.domain.https",
@@ -962,18 +1011,22 @@ options: {
 			"http://text.example.com",
 			"10.10.10.10:81",
 			"text.example.com:81",
-			// helmRelease
 			fmt.Sprintf("http://%s:30002", gatewayIP),
 			"http://ingress.domain.helm",
-			"1.1.1.1:80/seldon/test",
+			"http://1.1.1.1/seldon/default/sdep",
+			"http://gateway.domain",
+			"http://gateway.domain/api",
+			"https://demo.kubevela.net",
 		}
 		endValue, err := v.Field("list")
 		Expect(err).Should(BeNil())
 		var endpoints []querytypes.ServiceEndpoint
 		err = endValue.Decode(&endpoints)
 		Expect(err).Should(BeNil())
-		for i, endpoint := range endpoints {
-			Expect(endpoint.String()).Should(BeEquivalentTo(urls[i]))
+		Expect(len(urls)).Should(Equal(len(endpoints)))
+		for i, e := range endpoints {
+			fmt.Println(e.String())
+			Expect(urls[i]).Should(Equal(e.String()))
 		}
 	})
 })

@@ -18,12 +18,16 @@ package resourcekeeper
 
 import (
 	"context"
+	"fmt"
 
+	velaslices "github.com/kubevela/pkg/util/slices"
 	"github.com/pkg/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
 
-	"github.com/oam-dev/kubevela/apis/core.oam.dev/common"
+	"github.com/oam-dev/kubevela/apis/core.oam.dev/v1alpha1"
 	"github.com/oam-dev/kubevela/pkg/auth"
+	"github.com/oam-dev/kubevela/pkg/features"
 	"github.com/oam-dev/kubevela/pkg/multicluster"
 	"github.com/oam-dev/kubevela/pkg/oam"
 	"github.com/oam-dev/kubevela/pkg/resourcetracker"
@@ -43,7 +47,7 @@ type DispatchOption interface {
 type dispatchConfig struct {
 	rtConfig
 	metaOnly bool
-	creator  common.ResourceCreatorRole
+	creator  string
 }
 
 func newDispatchConfig(options ...DispatchOption) *dispatchConfig {
@@ -56,22 +60,32 @@ func newDispatchConfig(options ...DispatchOption) *dispatchConfig {
 
 // Dispatch dispatch resources
 func (h *resourceKeeper) Dispatch(ctx context.Context, manifests []*unstructured.Unstructured, applyOpts []apply.ApplyOption, options ...DispatchOption) (err error) {
-	if h.applyOncePolicy != nil && h.applyOncePolicy.Enable && h.applyOncePolicy.Rules == nil {
+	if utilfeature.DefaultMutableFeatureGate.Enabled(features.ApplyOnce) ||
+		(h.applyOncePolicy != nil && h.applyOncePolicy.Enable && h.applyOncePolicy.Rules == nil) {
 		options = append(options, MetaOnlyOption{})
 	}
+	h.ClearNamespaceForClusterScopedResources(manifests)
 	// 0. check admission
 	if err = h.AdmissionCheck(ctx, manifests); err != nil {
 		return err
 	}
-	// 1. record manifests in resourcetracker
-	if err = h.record(ctx, manifests, options...); err != nil {
-		return err
-	}
-	// 2. apply manifests
+	// 1. pre-dispatch check
 	opts := []apply.ApplyOption{apply.MustBeControlledByApp(h.app), apply.NotUpdateRenderHashEqual()}
 	if len(applyOpts) > 0 {
 		opts = append(opts, applyOpts...)
 	}
+	if utilfeature.DefaultMutableFeatureGate.Enabled(features.PreDispatchDryRun) {
+		if err = h.dispatch(ctx,
+			velaslices.Map(manifests, func(manifest *unstructured.Unstructured) *unstructured.Unstructured { return manifest.DeepCopy() }),
+			append([]apply.ApplyOption{apply.DryRunAll()}, opts...)); err != nil {
+			return fmt.Errorf("pre-dispatch dryrun failed: %w", err)
+		}
+	}
+	// 2. record manifests in resourcetracker
+	if err = h.record(ctx, manifests, options...); err != nil {
+		return err
+	}
+	// 3. apply manifests
 	if err = h.dispatch(ctx, manifests, opts); err != nil {
 		return err
 	}
@@ -81,6 +95,7 @@ func (h *resourceKeeper) Dispatch(ctx context.Context, manifests []*unstructured
 func (h *resourceKeeper) record(ctx context.Context, manifests []*unstructured.Unstructured, options ...DispatchOption) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	var skipGCManifests []*unstructured.Unstructured
 	var rootManifests []*unstructured.Unstructured
 	var versionManifests []*unstructured.Unstructured
 
@@ -93,24 +108,29 @@ func (h *resourceKeeper) record(ctx context.Context, manifests []*unstructured.U
 				}
 			}
 			cfg := newDispatchConfig(_options...)
-			if !cfg.skipRT {
-				if cfg.useRoot {
-					rootManifests = append(rootManifests, manifest)
-				} else {
-					versionManifests = append(versionManifests, manifest)
-				}
+			switch {
+			case cfg.skipGC:
+				skipGCManifests = append(skipGCManifests, manifest)
+			case cfg.useRoot:
+				rootManifests = append(rootManifests, manifest)
+			default:
+				versionManifests = append(versionManifests, manifest)
 			}
 		}
 	}
 
 	cfg := newDispatchConfig(options...)
-	if len(rootManifests) != 0 {
+	ctx = auth.ContextClearUserInfo(ctx)
+	if len(rootManifests)+len(skipGCManifests) != 0 {
 		rt, err := h.getRootRT(ctx)
 		if err != nil {
 			return errors.Wrapf(err, "failed to get resourcetracker")
 		}
-		if err = resourcetracker.RecordManifestsInResourceTracker(multicluster.ContextInLocalCluster(ctx), h.Client, rt, rootManifests, cfg.metaOnly, cfg.creator); err != nil {
+		if err = resourcetracker.RecordManifestsInResourceTracker(multicluster.ContextInLocalCluster(ctx), h.Client, rt, rootManifests, cfg.metaOnly, false, cfg.creator); err != nil {
 			return errors.Wrapf(err, "failed to record resources in resourcetracker %s", rt.Name)
+		}
+		if err = resourcetracker.RecordManifestsInResourceTracker(multicluster.ContextInLocalCluster(ctx), h.Client, rt, skipGCManifests, cfg.metaOnly, true, cfg.creator); err != nil {
+			return errors.Wrapf(err, "failed to record resources (skip-gc) in resourcetracker %s", rt.Name)
 		}
 	}
 
@@ -118,7 +138,7 @@ func (h *resourceKeeper) record(ctx context.Context, manifests []*unstructured.U
 	if err != nil {
 		return errors.Wrapf(err, "failed to get resourcetracker")
 	}
-	if err = resourcetracker.RecordManifestsInResourceTracker(multicluster.ContextInLocalCluster(ctx), h.Client, rt, versionManifests, cfg.metaOnly, cfg.creator); err != nil {
+	if err = resourcetracker.RecordManifestsInResourceTracker(multicluster.ContextInLocalCluster(ctx), h.Client, rt, versionManifests, cfg.metaOnly, false, cfg.creator); err != nil {
 		return errors.Wrapf(err, "failed to record resources in resourcetracker %s", rt.Name)
 	}
 	return nil
@@ -128,7 +148,21 @@ func (h *resourceKeeper) dispatch(ctx context.Context, manifests []*unstructured
 	errs := parallel.Run(func(manifest *unstructured.Unstructured) error {
 		applyCtx := multicluster.ContextWithClusterName(ctx, oam.GetCluster(manifest))
 		applyCtx = auth.ContextWithUserInfo(applyCtx, h.app)
-		return h.applicator.Apply(applyCtx, manifest, applyOpts...)
+		ao := applyOpts
+		if h.isShared(manifest) {
+			ao = append([]apply.ApplyOption{apply.SharedByApp(h.app)}, ao...)
+		}
+		if h.isReadOnly(manifest) {
+			ao = append([]apply.ApplyOption{apply.ReadOnly()}, ao...)
+		}
+		if h.canTakeOver(manifest) {
+			ao = append([]apply.ApplyOption{apply.TakeOver()}, ao...)
+		}
+		manifest, err := ApplyStrategies(applyCtx, h, manifest, v1alpha1.ApplyOnceStrategyOnAppUpdate)
+		if err != nil {
+			return errors.Wrapf(err, "failed to apply once policy for application %s,%s", h.app.Name, err.Error())
+		}
+		return h.applicator.Apply(applyCtx, manifest, ao...)
 	}, manifests, MaxDispatchConcurrent)
 	return velaerrors.AggregateErrors(errs.([]error))
 }

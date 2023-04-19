@@ -26,6 +26,7 @@ import (
 
 	"github.com/crossplane/crossplane-runtime/pkg/event"
 	"github.com/crossplane/crossplane-runtime/pkg/resource"
+	ctrlrec "github.com/kubevela/pkg/controller/reconciler"
 	"github.com/pkg/errors"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -37,6 +38,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
+	"github.com/kubevela/workflow/pkg/cue/packages"
+
 	commonapis "github.com/oam-dev/kubevela/apis/core.oam.dev/common"
 	"github.com/oam-dev/kubevela/apis/core.oam.dev/condition"
 	"github.com/oam-dev/kubevela/apis/core.oam.dev/v1alpha2"
@@ -44,7 +47,6 @@ import (
 	af "github.com/oam-dev/kubevela/pkg/appfile"
 	"github.com/oam-dev/kubevela/pkg/controller/common"
 	controller "github.com/oam-dev/kubevela/pkg/controller/core.oam.dev"
-	"github.com/oam-dev/kubevela/pkg/cue/packages"
 	"github.com/oam-dev/kubevela/pkg/multicluster"
 	"github.com/oam-dev/kubevela/pkg/oam"
 	"github.com/oam-dev/kubevela/pkg/oam/discoverymapper"
@@ -155,7 +157,7 @@ func NewReconciler(m ctrl.Manager, o ...ReconcilerOption) *Reconciler {
 
 // Reconcile an OAM HealthScope by keeping track of its health status.
 func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
-	ctx, cancel := common.NewReconcileContext(ctx)
+	ctx, cancel := ctrlrec.NewReconcileContext(ctx)
 	defer cancel()
 	klog.InfoS("Reconcile healthScope", "healthScope", klog.KRef(req.Namespace, req.Name))
 
@@ -396,7 +398,7 @@ func (r *Reconciler) CollectAppfilesAndAppNames(ctx context.Context, refs []Work
 }
 
 // UpdateStatus updates v1alpha2.HealthScope's Status with retry.RetryOnConflict
-func (r *Reconciler) UpdateStatus(ctx context.Context, hs *v1alpha2.HealthScope, opts ...client.UpdateOption) error {
+func (r *Reconciler) UpdateStatus(ctx context.Context, hs *v1alpha2.HealthScope, opts ...client.SubResourceUpdateOption) error {
 	status := hs.DeepCopy().Status
 	return retry.RetryOnConflict(retry.DefaultBackoff, func() (err error) {
 		if err = r.client.Get(ctx, types.NamespacedName{Namespace: hs.Namespace, Name: hs.Name}, hs); err != nil {

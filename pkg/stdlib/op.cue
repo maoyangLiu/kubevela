@@ -1,29 +1,4 @@
-import (
-	"encoding/json"
-	"encoding/base64"
-	"strings"
-)
-
-#ConditionalWait: {
-	#do:      "wait"
-	continue: bool
-	message?: string
-}
-
-#Break: {
-	#do:      "break"
-	message?: string
-}
-
-#Apply: kube.#Apply
-
-#ApplyInParallel: kube.#ApplyInParallel
-
-#Read: kube.#Read
-
-#List: kube.#List
-
-#Delete: kube.#Delete
+#GetPlacementsFromTopologyPolicies: multicluster.#GetPlacementsFromTopologyPolicies
 
 #Deploy: multicluster.#Deploy
 
@@ -60,7 +35,7 @@ import (
 #ApplyComponentRemaining: #Steps & {
 	// exceptions specify the resources not to apply.
 	exceptions: [...string]
-	_exceptions: {for c in exceptions {"\(c)": true}}
+	exceptions_: {for c in exceptions {"\(c)": true}}
 	component: string
 
 	load:   oam.#LoadComponets @step(1)
@@ -72,7 +47,7 @@ import (
 			value: rendered.output
 		}
 		for name, c in rendered.outputs {
-			if _exceptions[name] == _|_ {
+			if exceptions_[name] == _|_ {
 				"\(name)": kube.#Apply & {
 					value: c
 				}
@@ -84,12 +59,12 @@ import (
 #ApplyRemaining: #Steps & {
 	// exceptions specify the resources not to apply.
 	exceptions: [...string]
-	_exceptions: {for c in exceptions {"\(c)": true}}
+	exceptions_: {for c in exceptions {"\(c)": true}}
 
 	load:       oam.#LoadComponets @step(1)
 	components: #Steps & {
 		for name, c in load.value {
-			if _exceptions[name] == _|_ {
+			if exceptions_[name] == _|_ {
 				"\(name)": oam.#ApplyComponent & {
 					value: c
 				}
@@ -97,45 +72,6 @@ import (
 
 		}
 	} @step(2)
-}
-
-#DingTalk: #Steps & {
-	message: dingDing.#DingMessage
-	dingUrl: string
-	do:      http.#Do & {
-		method: "POST"
-		url:    dingUrl
-		request: {
-			body: json.Marshal(message)
-			header: "Content-Type": "application/json"
-		}
-	}
-}
-
-#Lark: #Steps & {
-	message: lark.#LarkMessage
-	larkUrl: string
-	do:      http.#Do & {
-		method: "POST"
-		url:    larkUrl
-		request: {
-			body: json.Marshal(message)
-			header: "Content-Type": "application/json"
-		}
-	}
-}
-
-#Slack: #Steps & {
-	message:  slack.#SlackMessage
-	slackUrl: string
-	do:       http.#Do & {
-		method: "POST"
-		url:    slackUrl
-		request: {
-			body: json.Marshal(message)
-			header: "Content-Type": "application/json"
-		}
-	}
 }
 
 #ApplyEnvBindApp: multicluster.#ApplyEnvBindApp
@@ -152,37 +88,6 @@ import (
 
 #PatchApplication: multicluster.#PatchApplication
 
-#HTTPGet: http.#Do & {method: "GET"}
-
-#HTTPPost: http.#Do & {method: "POST"}
-
-#HTTPPut: http.#Do & {method: "PUT"}
-
-#HTTPDelete: http.#Do & {method: "DELETE"}
-
-#ConvertString: util.#String
-
-#Log: util.#Log
-
-#DateToTimestamp: time.#DateToTimestamp
-
-#TimestampToDate: time.#TimestampToDate
-
-#SendEmail: email.#Send
-
 #Load: oam.#LoadComponets
 
 #LoadInOrder: oam.#LoadComponetsInOrder
-
-#PatchK8sObject: util.#PatchK8sObject
-
-#Steps: {
-	#do: "steps"
-	...
-}
-
-#Task: task.#Task
-
-NoExist: _|_
-
-context: _

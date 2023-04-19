@@ -1,13 +1,10 @@
 "init-container": {
 	type: "trait"
 	annotations: {}
-	labels: {
-		"ui-hidden": "true"
-	}
 	description: "add an init container and use shared volume with pod"
 	attributes: {
 		podDisruptive: true
-		appliesToWorkloads: ["deployments.apps"]
+		appliesToWorkloads: ["deployments.apps", "statefulsets.apps", "daemonsets.apps", "jobs.batch"]
 	}
 }
 template: {
@@ -21,9 +18,11 @@ template: {
 				mountPath: parameter.appMountPath
 			}]
 		}]
+		// +patchKey=name
 		initContainers: [{
-			name:  parameter.name
-			image: parameter.image
+			name:            parameter.name
+			image:           parameter.image
+			imagePullPolicy: parameter.imagePullPolicy
 			if parameter.cmd != _|_ {
 				command: parameter.cmd
 			}
@@ -38,7 +37,7 @@ template: {
 			volumeMounts: [{
 				name:      parameter.mountName
 				mountPath: parameter.initMountPath
-			}]
+			}] + parameter.extraVolumeMounts
 		}]
 		// +patchKey=name
 		volumes: [{
@@ -52,6 +51,9 @@ template: {
 
 		// +usage=Specify the image of init container
 		image: string
+
+		// +usage=Specify image pull policy for your service
+		imagePullPolicy: *"IfNotPresent" | "Always" | "Never"
 
 		// +usage=Specify the commands run in the init container
 		cmd?: [...string]
@@ -92,5 +94,13 @@ template: {
 
 		// +usage=Specify the mount path of init container
 		initMountPath: string
+
+		// +usage=Specify the extra volume mounts for the init container
+		extraVolumeMounts: [...{
+			// +usage=The name of the volume to be mounted
+			name: string
+			// +usage=The mountPath for mount in the init container
+			mountPath: string
+		}]
 	}
 }

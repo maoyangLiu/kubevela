@@ -4,7 +4,7 @@ apiVersion: core.oam.dev/v1beta1
 kind: PolicyDefinition
 metadata:
   annotations:
-    definition.oam.dev/description: Determining the destination where components should be deployed to.
+    definition.oam.dev/description: Describe the destination where components should be deployed to.
   name: topology
   namespace: {{ include "systemDefinitionNamespace" . }}
 spec:
@@ -13,9 +13,11 @@ spec:
       template: |
         parameter: {
         	// +usage=Specify the names of the clusters to select.
-        	cluster?: [...string]
+        	clusters?: [...string]
         	// +usage=Specify the label selector for clusters
         	clusterLabelSelector?: [string]: string
+        	// +usage=Ignore empty cluster error
+        	allowEmpty?: bool
         	// +usage=Deprecated: Use clusterLabelSelector instead.
         	clusterSelector?: [string]: string
         	// +usage=Specify the target namespace to deploy in the selected clusters, default inherit the original namespace.

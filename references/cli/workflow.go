@@ -19,25 +19,26 @@ package cli
 import (
 	"context"
 	"fmt"
+	"io"
+	"os"
 
+	"github.com/AlecAivazis/survey/v2"
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
-	k8stypes "k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	oamcommon "github.com/oam-dev/kubevela/apis/core.oam.dev/common"
+	pkgmulticluster "github.com/kubevela/pkg/multicluster"
+	workflowv1alpha1 "github.com/kubevela/workflow/api/v1alpha1"
+	wfTypes "github.com/kubevela/workflow/pkg/types"
+	wfUtils "github.com/kubevela/workflow/pkg/utils"
+
+	"github.com/oam-dev/kubevela/apis/core.oam.dev/v1alpha1"
 	"github.com/oam-dev/kubevela/apis/core.oam.dev/v1beta1"
 	"github.com/oam-dev/kubevela/apis/types"
-	"github.com/oam-dev/kubevela/pkg/apiserver/domain/service"
-	"github.com/oam-dev/kubevela/pkg/controller/core.oam.dev/v1alpha2/application"
-	"github.com/oam-dev/kubevela/pkg/controller/utils"
-	"github.com/oam-dev/kubevela/pkg/oam"
-	"github.com/oam-dev/kubevela/pkg/resourcetracker"
 	"github.com/oam-dev/kubevela/pkg/utils/common"
-	velaerrors "github.com/oam-dev/kubevela/pkg/utils/errors"
 	cmdutil "github.com/oam-dev/kubevela/pkg/utils/util"
-	"github.com/oam-dev/kubevela/references/appfile"
+	querytypes "github.com/oam-dev/kubevela/pkg/velaql/providers/query/types"
+	"github.com/oam-dev/kubevela/pkg/workflow/operation"
 )
 
 // NewWorkflowCommand create `workflow` command
@@ -45,399 +46,508 @@ func NewWorkflowCommand(c common.Args, ioStreams cmdutil.IOStreams) *cobra.Comma
 	cmd := &cobra.Command{
 		Use:   "workflow",
 		Short: "Operate application delivery workflow.",
-		Long:  "Operate the Workflow during Application Delivery.",
+		Long:  "Operate the Workflow during Application Delivery. Note that workflow command is both valid for Application Workflow and WorkflowRun(expect for [restart, rollout] command, they're only valid for Application Workflow). The command will try to find the Application first, if not found, it will try to find WorkflowRun. You can also specify the resource type by using --type flag.",
 		Annotations: map[string]string{
 			types.TagCommandType: types.TypeCD,
 		},
 	}
+	wargs := &WorkflowArgs{
+		Args:   c,
+		Writer: ioStreams.Out,
+	}
 	cmd.AddCommand(
-		NewWorkflowSuspendCommand(c, ioStreams),
-		NewWorkflowResumeCommand(c, ioStreams),
-		NewWorkflowTerminateCommand(c, ioStreams),
-		NewWorkflowRestartCommand(c, ioStreams),
-		NewWorkflowRollbackCommand(c, ioStreams),
+		NewWorkflowSuspendCommand(c, ioStreams, wargs),
+		NewWorkflowResumeCommand(c, ioStreams, wargs),
+		NewWorkflowTerminateCommand(c, ioStreams, wargs),
+		NewWorkflowRestartCommand(c, ioStreams, wargs),
+		NewWorkflowRollbackCommand(c, ioStreams, wargs),
+		NewWorkflowLogsCommand(c, ioStreams, wargs),
+		NewWorkflowDebugCommand(c, ioStreams, wargs),
 	)
 	return cmd
 }
 
 // NewWorkflowSuspendCommand create workflow suspend command
-func NewWorkflowSuspendCommand(c common.Args, ioStream cmdutil.IOStreams) *cobra.Command {
+func NewWorkflowSuspendCommand(c common.Args, ioStream cmdutil.IOStreams, wargs *WorkflowArgs) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:     "suspend",
-		Short:   "Suspend an application workflow.",
-		Long:    "Suspend an application workflow in cluster.",
-		Example: "vela workflow suspend <application-name>",
+		Short:   "Suspend a workflow.",
+		Long:    "Suspend a workflow in cluster.",
+		Example: "vela workflow suspend <workflow-name>",
+		PreRun:  wargs.checkWorkflowNotComplete(),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if len(args) < 1 {
-				return fmt.Errorf("must specify application name")
-			}
-			namespace, err := GetFlagNamespaceOrEnv(cmd, c)
-			if err != nil {
+			ctx := context.Background()
+			if err := wargs.getWorkflowInstance(ctx, cmd, args); err != nil {
 				return err
 			}
-			app, err := appfile.LoadApplication(namespace, args[0], c)
-			if err != nil {
-				return err
+			if wargs.StepName != "" {
+				return wargs.StepOperator.Suspend(ctx, wargs.StepName)
 			}
-			if app.Status.Workflow == nil {
-				return fmt.Errorf("the workflow in application is not running")
-			}
-			client, err := c.GetClient()
-			if err != nil {
-				return err
-			}
-			err = suspendWorkflow(client, app)
-			if err != nil {
-				return err
-			}
-			return nil
+			return wargs.Operator.Suspend(ctx)
 		},
 	}
 	addNamespaceAndEnvArg(cmd)
+	cmd.Flags().StringVarP(&wargs.StepName, "step", "s", "", "specify the step name in the workflow")
+	cmd.Flags().StringVarP(&wargs.Type, "type", "t", "", "the type of the resource, support: [app, workflow]")
 	return cmd
 }
 
 // NewWorkflowResumeCommand create workflow resume command
-func NewWorkflowResumeCommand(c common.Args, ioStream cmdutil.IOStreams) *cobra.Command {
+func NewWorkflowResumeCommand(c common.Args, ioStream cmdutil.IOStreams, wargs *WorkflowArgs) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:     "resume",
-		Short:   "Resume a suspend application workflow.",
-		Long:    "Resume a suspend application workflow in cluster.",
-		Example: "vela workflow resume <application-name>",
+		Short:   "Resume a suspend workflow.",
+		Long:    "Resume a suspend workflow in cluster.",
+		Example: "vela workflow resume <workflow-name>",
+		PreRun:  wargs.checkWorkflowNotComplete(),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if len(args) < 1 {
-				return fmt.Errorf("must specify application name")
-			}
-			namespace, err := GetFlagNamespaceOrEnv(cmd, c)
-			if err != nil {
+			ctx := context.Background()
+			if err := wargs.getWorkflowInstance(ctx, cmd, args); err != nil {
 				return err
 			}
-			app, err := appfile.LoadApplication(namespace, args[0], c)
-			if err != nil {
-				return err
+			if wargs.StepName != "" {
+				return wargs.StepOperator.Resume(ctx, wargs.StepName)
 			}
-			if app.Status.Workflow == nil {
-				return fmt.Errorf("the workflow in application is not running")
-			}
-			if app.Status.Workflow.Terminated {
-				return fmt.Errorf("can not resume a terminated workflow")
-			}
-			if !app.Status.Workflow.Suspend {
-				_, err := ioStream.Out.Write([]byte("the workflow is not suspending\n"))
-				if err != nil {
-					return err
-				}
-				return nil
-			}
-			client, err := c.GetClient()
-			if err != nil {
-				return err
-			}
-
-			err = resumeWorkflow(client, app)
-			if err != nil {
-				return err
-			}
-			return nil
+			return wargs.Operator.Resume(ctx)
 		},
 	}
 	addNamespaceAndEnvArg(cmd)
+	cmd.Flags().StringVarP(&wargs.StepName, "step", "s", "", "specify the step name in the workflow")
+	cmd.Flags().StringVarP(&wargs.Type, "type", "t", "", "the type of the resource, support: [app, workflow]")
 	return cmd
 }
 
 // NewWorkflowTerminateCommand create workflow terminate command
-func NewWorkflowTerminateCommand(c common.Args, ioStream cmdutil.IOStreams) *cobra.Command {
+func NewWorkflowTerminateCommand(c common.Args, ioStream cmdutil.IOStreams, wargs *WorkflowArgs) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:     "terminate",
-		Short:   "Terminate an application workflow.",
-		Long:    "Terminate an application workflow in cluster.",
-		Example: "vela workflow terminate <application-name>",
+		Short:   "Terminate a workflow.",
+		Long:    "Terminate a workflow in cluster.",
+		Example: "vela workflow terminate <workflow-name>",
+		PreRun:  wargs.checkWorkflowNotComplete(),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if len(args) < 1 {
-				return fmt.Errorf("must specify application name")
-			}
-			namespace, err := GetFlagNamespaceOrEnv(cmd, c)
-			if err != nil {
+			ctx := context.Background()
+			if err := wargs.getWorkflowInstance(ctx, cmd, args); err != nil {
 				return err
 			}
-			app, err := appfile.LoadApplication(namespace, args[0], c)
-			if err != nil {
-				return err
-			}
-			if app.Status.Workflow == nil {
-				return fmt.Errorf("the workflow in application is not running")
-			}
-			client, err := c.GetClient()
-			if err != nil {
-				return err
-			}
-			err = terminateWorkflow(client, app)
-			if err != nil {
-				return err
-			}
-			return nil
+			return wargs.Operator.Terminate(ctx)
 		},
 	}
 	addNamespaceAndEnvArg(cmd)
+	cmd.Flags().StringVarP(&wargs.Type, "type", "t", "", "the type of the resource, support: [app, workflow]")
 	return cmd
 }
 
 // NewWorkflowRestartCommand create workflow restart command
-func NewWorkflowRestartCommand(c common.Args, ioStream cmdutil.IOStreams) *cobra.Command {
+func NewWorkflowRestartCommand(c common.Args, ioStream cmdutil.IOStreams, wargs *WorkflowArgs) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:     "restart",
-		Short:   "Restart an application workflow.",
-		Long:    "Restart an application workflow in cluster.",
-		Example: "vela workflow restart <application-name>",
+		Short:   "Restart a workflow.",
+		Long:    "Restart a workflow in cluster.",
+		Example: "vela workflow restart <workflow-name>",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if len(args) < 1 {
-				return fmt.Errorf("must specify application name")
-			}
-			namespace, err := GetFlagNamespaceOrEnv(cmd, c)
-			if err != nil {
+			ctx := context.Background()
+			if err := wargs.getWorkflowInstance(ctx, cmd, args); err != nil {
 				return err
 			}
-			app, err := appfile.LoadApplication(namespace, args[0], c)
-			if err != nil {
-				return err
+			if wargs.StepName != "" {
+				return wargs.StepOperator.Restart(ctx, wargs.StepName)
 			}
-			if app.Status.Workflow == nil {
-				return fmt.Errorf("the workflow in application is not running")
-			}
-			client, err := c.GetClient()
-			if err != nil {
-				return err
-			}
-
-			err = restartWorkflow(client, app)
-			if err != nil {
-				return err
-			}
-			return nil
+			return wargs.Operator.Restart(ctx)
 		},
 	}
 	addNamespaceAndEnvArg(cmd)
+	cmd.Flags().StringVarP(&wargs.StepName, "step", "s", "", "specify the step name in the workflow")
+	cmd.Flags().StringVarP(&wargs.Type, "type", "t", "", "the type of the resource, support: [app, workflow]")
 	return cmd
 }
 
 // NewWorkflowRollbackCommand create workflow rollback command
-func NewWorkflowRollbackCommand(c common.Args, ioStream cmdutil.IOStreams) *cobra.Command {
+func NewWorkflowRollbackCommand(c common.Args, ioStream cmdutil.IOStreams, wargs *WorkflowArgs) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:     "rollback",
 		Short:   "Rollback an application workflow to the latest revision.",
 		Long:    "Rollback an application workflow to the latest revision.",
 		Example: "vela workflow rollback <application-name>",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if len(args) < 1 {
-				return fmt.Errorf("must specify application name")
-			}
-			namespace, err := GetFlagNamespaceOrEnv(cmd, c)
-			if err != nil {
+			ctx := context.Background()
+			if err := wargs.getWorkflowInstance(ctx, cmd, args); err != nil {
 				return err
 			}
-			app, err := appfile.LoadApplication(namespace, args[0], c)
-			if err != nil {
-				return err
-			}
-			if app.Status.Workflow != nil && !app.Status.Workflow.Terminated && !app.Status.Workflow.Suspend && !app.Status.Workflow.Finished {
-				return fmt.Errorf("can not rollback a running workflow")
-			}
-			client, err := c.GetClient()
-			if err != nil {
-				return err
-			}
-
-			err = rollbackWorkflow(cmd, client, app)
-			if err != nil {
-				return err
-			}
-			return nil
+			return wargs.Operator.Rollback(ctx)
 		},
 	}
+	addNamespaceAndEnvArg(cmd)
+	cmd.Flags().StringVarP(&wargs.Type, "type", "t", "", "the type of the resource, support: [app, workflow]")
+	return cmd
+}
+
+// NewWorkflowLogsCommand create workflow logs command
+func NewWorkflowLogsCommand(c common.Args, ioStream cmdutil.IOStreams, wargs *WorkflowArgs) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:     "logs",
+		Short:   "Tail logs for workflow steps",
+		Long:    "Tail logs for workflow steps, note that you need to use op.#Logs in step definition to set the log config of the step.",
+		Example: "vela workflow logs <workflow-name>",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cli, err := c.GetClient()
+			if err != nil {
+				return err
+			}
+			ctx := context.Background()
+			if err := wargs.getWorkflowInstance(ctx, cmd, args); err != nil {
+				return err
+			}
+			return wargs.printStepLogs(ctx, cli, ioStream)
+		},
+	}
+	cmd.Flags().StringVarP(&wargs.StepName, "step", "s", "", "specify the step name in the workflow")
+	cmd.Flags().StringVarP(&wargs.Output, "output", "o", "default", "output format for logs, support: [default, raw, json]")
+	cmd.Flags().StringVarP(&wargs.Type, "type", "t", "", "the type of the resource, support: [app, workflow]")
 	addNamespaceAndEnvArg(cmd)
 	return cmd
 }
 
-func suspendWorkflow(kubecli client.Client, app *v1beta1.Application) error {
-	appKey := client.ObjectKeyFromObject(app)
-	ctx := context.Background()
-	if err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
-		if err := kubecli.Get(ctx, appKey, app); err != nil {
+// NewWorkflowDebugCommand create workflow debug command
+func NewWorkflowDebugCommand(c common.Args, ioStream cmdutil.IOStreams, wargs *WorkflowArgs) *cobra.Command {
+	dOpts := &debugOpts{
+		step: wargs.StepName,
+	}
+	cmd := &cobra.Command{
+		Use:     "debug",
+		Short:   "Debug workflow steps",
+		Long:    "Debug workflow steps",
+		Example: "vela workflow debug <workflow-name>",
+		PreRun:  wargs.checkDebugMode(),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cli, err := c.GetClient()
+			if err != nil {
+				return err
+			}
+			pd, err := c.GetPackageDiscover()
+			if err != nil {
+				return err
+			}
+			ctx := context.Background()
+			if err := wargs.getWorkflowInstance(ctx, cmd, args); err != nil {
+				return err
+			}
+			dOpts.opts = wargs.getWorkflowSteps()
+			dOpts.errMap = wargs.ErrMap
+			return dOpts.debugWorkflow(ctx, wargs, cli, pd, ioStream)
+		},
+	}
+	cmd.Flags().StringVarP(&wargs.StepName, "step", "s", "", "specify the step name in the workflow")
+	cmd.Flags().StringVarP(&dOpts.focus, "focus", "f", "", "specify the focus value to debug, only valid for application with workflow")
+	cmd.Flags().StringVarP(&wargs.Type, "type", "t", "", "the type of the resource, support: [app, workflow]")
+	addNamespaceAndEnvArg(cmd)
+	return cmd
+}
+
+// WorkflowArgs is the args for workflow command
+type WorkflowArgs struct {
+	Type             string
+	Output           string
+	ControllerLabels map[string]string
+	Operator         wfUtils.WorkflowOperator
+	StepOperator     wfUtils.WorkflowStepOperator
+	Writer           io.Writer
+	Args             common.Args
+	StepName         string
+	StepID           string
+	ErrMap           map[string]string
+	App              *v1beta1.Application
+	WorkflowRun      *workflowv1alpha1.WorkflowRun
+	WorkflowInstance *wfTypes.WorkflowInstance
+}
+
+const (
+	instanceTypeApplication string = "app"
+	instanceTypeWorkflowRun string = "workflow"
+)
+
+func (w *WorkflowArgs) getWorkflowInstance(ctx context.Context, cmd *cobra.Command, args []string) error {
+	if len(args) < 1 {
+		return fmt.Errorf("please specify the name of application/workflow")
+	}
+	name := args[0]
+	namespace, err := GetFlagNamespaceOrEnv(cmd, w.Args)
+	if err != nil {
+		return err
+	}
+	cli, err := w.Args.GetClient()
+	if err != nil {
+		return err
+	}
+	config, err := w.Args.GetConfig()
+	if err != nil {
+		return err
+	}
+	config.Wrap(pkgmulticluster.NewTransportWrapper())
+	switch w.Type {
+	case "":
+		app := &v1beta1.Application{}
+		if err := cli.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, app); err == nil {
+			w.Type = instanceTypeApplication
+			w.App = app
+		} else {
+			wr := &workflowv1alpha1.WorkflowRun{}
+			if err := cli.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, wr); err == nil {
+				w.Type = instanceTypeWorkflowRun
+				w.WorkflowRun = wr
+			}
+		}
+		if w.Type == "" {
+			return fmt.Errorf("can't find application or workflowrun %s", name)
+		}
+	case instanceTypeApplication:
+		app := &v1beta1.Application{}
+		if err := cli.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, app); err != nil {
 			return err
 		}
-		// set the workflow suspend to true
-		app.Status.Workflow.Suspend = true
-		return kubecli.Status().Patch(ctx, app, client.Merge)
-	}); err != nil {
-		return err
-	}
-	fmt.Printf("Successfully suspend workflow: %s\n", app.Name)
-	return nil
-}
-
-func resumeWorkflow(kubecli client.Client, app *v1beta1.Application) error {
-	if err := service.ResumeWorkflow(context.TODO(), kubecli, app); err != nil {
-		return err
-	}
-
-	fmt.Printf("Successfully resume workflow: %s\n", app.Name)
-	return nil
-}
-
-func terminateWorkflow(kubecli client.Client, app *v1beta1.Application) error {
-	if err := service.TerminateWorkflow(context.TODO(), kubecli, app); err != nil {
-		return err
-	}
-
-	fmt.Printf("Successfully terminate workflow: %s\n", app.Name)
-	return nil
-}
-
-func restartWorkflow(kubecli client.Client, app *v1beta1.Application) error {
-	// reset the workflow status to restart the workflow
-	app.Status.Workflow = nil
-
-	if err := kubecli.Status().Update(context.TODO(), app); err != nil {
-		return err
-	}
-
-	fmt.Printf("Successfully restart workflow: %s\n", app.Name)
-	return nil
-}
-
-func rollbackWorkflow(cmd *cobra.Command, kubecli client.Client, app *v1beta1.Application) error {
-	if oam.GetPublishVersion(app) != "" {
-		return rollbackApplicationWithPublishVersion(cmd, kubecli, app)
-	}
-	if app.Status.LatestRevision == nil || app.Status.LatestRevision.Name == "" {
-		return fmt.Errorf("the latest revision is not set: %s", app.Name)
-	}
-	// get the last revision
-	revision := &v1beta1.ApplicationRevision{}
-	if err := kubecli.Get(context.TODO(), k8stypes.NamespacedName{Name: app.Status.LatestRevision.Name, Namespace: app.Namespace}, revision); err != nil {
-		return fmt.Errorf("failed to get the latest revision: %w", err)
-	}
-
-	app.Spec = revision.Spec.Application.Spec
-	if err := kubecli.Status().Update(context.TODO(), app); err != nil {
-		return err
-	}
-
-	fmt.Printf("Successfully rollback workflow to the latest revision: %s\n", app.Name)
-	return nil
-}
-
-func rollbackApplicationWithPublishVersion(cmd *cobra.Command, cli client.Client, app *v1beta1.Application) error {
-	ctx := context.Background()
-	appRevs, err := application.GetSortedAppRevisions(ctx, cli, app.Name, app.Namespace)
-	if err != nil {
-		return errors.Wrapf(err, "failed to list revisions for application %s/%s", app.Namespace, app.Name)
-	}
-
-	// find succeeded revision to rollback
-	var rev *v1beta1.ApplicationRevision
-	var outdatedRev []*v1beta1.ApplicationRevision
-	for i := range appRevs {
-		candidate := appRevs[len(appRevs)-i-1]
-		_rev := candidate.DeepCopy()
-		if !candidate.Status.Succeeded || oam.GetPublishVersion(_rev) == "" {
-			outdatedRev = append(outdatedRev, _rev)
-			continue
-		}
-		rev = _rev
-		break
-	}
-	if rev == nil {
-		return errors.Errorf("failed to find previous succeeded revision for application %s/%s", app.Namespace, app.Name)
-	}
-	publishVersion := oam.GetPublishVersion(rev)
-	revisionNumber, err := utils.ExtractRevision(rev.Name)
-	if err != nil {
-		return errors.Wrapf(err, "failed to extract revision number from revision %s", rev.Name)
-	}
-	_, currentRT, historyRTs, _, err := resourcetracker.ListApplicationResourceTrackers(ctx, cli, app)
-	if err != nil {
-		return errors.Wrapf(err, "failed to list resource trackers for application %s/%s", app.Namespace, app.Name)
-	}
-	var matchRT *v1beta1.ResourceTracker
-	for _, rt := range append(historyRTs, currentRT) {
-		if rt == nil {
-			continue
-		}
-		labels := rt.GetLabels()
-		if labels != nil && labels[oam.LabelAppRevision] == rev.Name {
-			matchRT = rt.DeepCopy()
-		}
-	}
-	if matchRT == nil {
-		return errors.Errorf("cannot find resource tracker for previous revision %s, unable to rollback", rev.Name)
-	}
-	if matchRT.DeletionTimestamp != nil {
-		return errors.Errorf("previous revision %s is being recycled, unable to rollback", rev.Name)
-	}
-	cmd.Printf("Find succeeded application revision %s (PublishVersion: %s) to rollback.\n", rev.Name, publishVersion)
-
-	appKey := client.ObjectKeyFromObject(app)
-	// rollback application spec and freeze
-	controllerRequirement, err := utils.FreezeApplication(ctx, cli, app, func() {
-		app.Spec = rev.Spec.Application.Spec
-		oam.SetPublishVersion(app, publishVersion)
-	})
-	if err != nil {
-		return errors.Wrapf(err, "failed to rollback application spec to revision %s (PublishVersion: %s)", rev.Name, publishVersion)
-	}
-	cmd.Printf("Application spec rollback successfully.\n")
-
-	// rollback application status
-	if err = retry.RetryOnConflict(retry.DefaultBackoff, func() error {
-		if err = cli.Get(ctx, appKey, app); err != nil {
+		w.App = app
+	case instanceTypeWorkflowRun:
+		wr := &workflowv1alpha1.WorkflowRun{}
+		if err := cli.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, wr); err != nil {
 			return err
 		}
-		app.Status.Workflow = rev.Status.Workflow
-		app.Status.Services = []oamcommon.ApplicationComponentStatus{}
-		app.Status.AppliedResources = []oamcommon.ClusterObjectReference{}
-		for _, rsc := range matchRT.Spec.ManagedResources {
-			app.Status.AppliedResources = append(app.Status.AppliedResources, rsc.ClusterObjectReference)
-		}
-		app.Status.LatestRevision = &oamcommon.Revision{
-			Name:         rev.Name,
-			Revision:     int64(revisionNumber),
-			RevisionHash: rev.GetLabels()[oam.LabelAppRevisionHash],
-		}
-		return cli.Status().Update(ctx, app)
-	}); err != nil {
-		return errors.Wrapf(err, "failed to rollback application status to revision %s (PublishVersion: %s)", rev.Name, publishVersion)
+		w.WorkflowRun = wr
+	default:
 	}
-	cmd.Printf("Application status rollback successfully.\n")
+	return w.generateWorkflowInstance(ctx, cli)
+}
 
-	// update resource tracker generation
-	matchRTKey := client.ObjectKeyFromObject(matchRT)
-	if err = retry.RetryOnConflict(retry.DefaultBackoff, func() error {
-		if err = cli.Get(ctx, matchRTKey, matchRT); err != nil {
+func (w *WorkflowArgs) generateWorkflowInstance(ctx context.Context, cli client.Client) error {
+	debug := false
+	switch w.Type {
+	case instanceTypeApplication:
+		if w.App.Status.Workflow == nil {
+			return fmt.Errorf("the workflow in application %s is not start", w.App.Name)
+		}
+		for _, policy := range w.App.Spec.Policies {
+			if policy.Type == v1alpha1.DebugPolicyType {
+				debug = true
+				break
+			}
+		}
+		status := w.App.Status.Workflow
+		w.WorkflowInstance = &wfTypes.WorkflowInstance{
+			WorkflowMeta: wfTypes.WorkflowMeta{
+				Name:      w.App.Name,
+				Namespace: w.App.Namespace,
+				UID:       w.App.UID,
+			},
+			Debug: debug,
+			Status: workflowv1alpha1.WorkflowRunStatus{
+				Phase:          status.Phase,
+				Message:        status.Message,
+				Suspend:        status.Suspend,
+				SuspendState:   status.SuspendState,
+				Terminated:     status.Terminated,
+				Finished:       status.Finished,
+				ContextBackend: status.ContextBackend,
+				Steps:          status.Steps,
+				StartTime:      status.StartTime,
+				EndTime:        status.EndTime,
+			},
+		}
+		if w.App.Spec.Workflow != nil {
+			w.WorkflowInstance.Steps = w.App.Spec.Workflow.Steps
+		}
+		w.Operator = operation.NewApplicationWorkflowOperator(cli, w.Writer, w.App)
+		w.StepOperator = operation.NewApplicationWorkflowStepOperator(cli, w.Writer, w.App)
+		w.ControllerLabels = map[string]string{"app.kubernetes.io/name": "vela-core"}
+	case instanceTypeWorkflowRun:
+		var steps []workflowv1alpha1.WorkflowStep
+		if w.WorkflowRun.Spec.WorkflowRef != "" {
+			workflow := &workflowv1alpha1.Workflow{}
+			if err := cli.Get(ctx, client.ObjectKey{Namespace: w.WorkflowRun.Namespace, Name: w.WorkflowRun.Spec.WorkflowRef}, workflow); err != nil {
+				return err
+			}
+			steps = workflow.Steps
+		} else {
+			steps = w.WorkflowRun.Spec.WorkflowSpec.Steps
+		}
+		if w.WorkflowRun.Annotations != nil {
+			if d, ok := w.WorkflowRun.Annotations[wfTypes.AnnotationWorkflowRunDebug]; ok && d == "true" {
+				debug = true
+			}
+		}
+		w.WorkflowInstance = &wfTypes.WorkflowInstance{
+			WorkflowMeta: wfTypes.WorkflowMeta{
+				Name:      w.WorkflowRun.Name,
+				Namespace: w.WorkflowRun.Namespace,
+				UID:       w.WorkflowRun.UID,
+			},
+			Steps:  steps,
+			Status: w.WorkflowRun.Status,
+			Debug:  debug,
+		}
+		w.Operator = wfUtils.NewWorkflowRunOperator(cli, w.Writer, w.WorkflowRun)
+		w.StepOperator = wfUtils.NewWorkflowRunStepOperator(cli, w.Writer, w.WorkflowRun)
+		w.ControllerLabels = map[string]string{"app.kubernetes.io/name": "vela-workflow"}
+	default:
+		return fmt.Errorf("unknown workflow instance type %s", w.Type)
+	}
+	return nil
+}
+
+func (w *WorkflowArgs) printStepLogs(ctx context.Context, cli client.Client, ioStreams cmdutil.IOStreams) error {
+	if w.StepName == "" {
+		if err := w.selectWorkflowStep("Select a step to show logs:"); err != nil {
 			return err
 		}
-		matchRT.Spec.ApplicationGeneration = app.Generation
-		return cli.Update(ctx, matchRT)
-	}); err != nil {
-		return errors.Wrapf(err, "failed to update application generation in resource tracker")
 	}
-
-	// unfreeze application
-	if err = utils.UnfreezeApplication(ctx, cli, app, nil, controllerRequirement); err != nil {
-		return errors.Wrapf(err, "failed to resume application to restart")
+	if w.WorkflowInstance.Status.ContextBackend == nil {
+		return fmt.Errorf("the workflow context backend is not set")
 	}
-	cmd.Printf("Application rollback completed.\n")
-
-	// clean up outdated revisions
-	var errs velaerrors.ErrorList
-	for _, _rev := range outdatedRev {
-		if err = cli.Delete(ctx, _rev); err != nil {
-			errs = append(errs, err)
+	logConfig, err := wfUtils.GetLogConfigFromStep(ctx, cli, w.WorkflowInstance.Status.ContextBackend.Name, w.WorkflowInstance.Name, w.WorkflowInstance.Namespace, w.StepName)
+	if err != nil {
+		return errors.WithMessage(err, fmt.Sprintf("step [%s]", w.StepName))
+	}
+	if err := selectStepLogSource(logConfig); err != nil {
+		return err
+	}
+	switch {
+	case logConfig.Data:
+		return w.printResourceLogs(ctx, cli, ioStreams, []wfTypes.Resource{{
+			Namespace:     types.DefaultKubeVelaNS,
+			LabelSelector: w.ControllerLabels,
+		}}, []string{fmt.Sprintf(`stepSessionID="%s"`, w.StepID), fmt.Sprintf("%s/%s", w.WorkflowInstance.Namespace, w.WorkflowInstance.Name), "cue logs"})
+	case logConfig.Source != nil:
+		if len(logConfig.Source.Resources) > 0 {
+			return w.printResourceLogs(ctx, cli, ioStreams, logConfig.Source.Resources, nil)
+		}
+		if logConfig.Source.URL != "" {
+			readCloser, err := wfUtils.GetLogsFromURL(ctx, logConfig.Source.URL)
+			if err != nil {
+				return err
+			}
+			//nolint:errcheck
+			defer readCloser.Close()
+			if _, err := io.Copy(ioStreams.Out, readCloser); err != nil {
+				return err
+			}
 		}
 	}
-	if errs.HasError() {
-		return errors.Wrapf(errs, "failed to clean up outdated revisions")
-	}
-	cmd.Printf("Application outdated revision cleaned up.\n")
 	return nil
+}
+
+func (w *WorkflowArgs) getWorkflowSteps() []string {
+	if w.ErrMap == nil {
+		w.ErrMap = make(map[string]string)
+	}
+	stepsKey := make([]string, 0)
+	for _, step := range w.WorkflowInstance.Status.Steps {
+		stepsKey = append(stepsKey, wrapStepName(step.StepStatus))
+		if step.Phase == workflowv1alpha1.WorkflowStepPhaseFailed {
+			w.ErrMap[step.Name] = step.Message
+		}
+		for _, sub := range step.SubStepsStatus {
+			stepsKey = append(stepsKey, fmt.Sprintf("  %s", wrapStepName(sub)))
+			if sub.Phase == workflowv1alpha1.WorkflowStepPhaseFailed {
+				w.ErrMap[step.Name] = sub.Message
+			}
+		}
+	}
+	return stepsKey
+}
+
+func (w *WorkflowArgs) selectWorkflowStep(msg string) error {
+	stepsKey := w.getWorkflowSteps()
+	if len(stepsKey) == 0 {
+		return fmt.Errorf("workflow is not start")
+	}
+
+	prompt := &survey.Select{
+		Message: msg,
+		Options: stepsKey,
+	}
+	var stepName string
+	err := survey.AskOne(prompt, &stepName, survey.WithValidator(survey.Required))
+	if err != nil {
+		return fmt.Errorf("failed to select step %s: %w", unwrapStepName(w.StepName), err)
+	}
+	w.StepName = unwrapStepName(stepName)
+	w.StepID = unwrapStepID(stepName, w.WorkflowInstance)
+	return nil
+}
+
+func selectStepLogSource(logConfig *wfTypes.LogConfig) error {
+	var source string
+	if logConfig.Data && logConfig.Source != nil {
+		prompt := &survey.Select{
+			Message: "Select logs from data or source",
+			Options: []string{"data", "source"},
+		}
+		err := survey.AskOne(prompt, &source, survey.WithValidator(survey.Required))
+		if err != nil {
+			return fmt.Errorf("failed to select %s: %w", source, err)
+		}
+		if source != "data" {
+			logConfig.Data = false
+		}
+	}
+	return nil
+}
+
+func (w *WorkflowArgs) printResourceLogs(ctx context.Context, cli client.Client, ioStreams cmdutil.IOStreams, resources []wfTypes.Resource, filters []string) error {
+	pods, err := wfUtils.GetPodListFromResources(ctx, cli, resources)
+	if err != nil {
+		return err
+	}
+	podList := make([]querytypes.PodBase, 0)
+	for _, pod := range pods {
+		podBase := querytypes.PodBase{}
+		podBase.Metadata.Name = pod.Name
+		podBase.Metadata.Namespace = pod.Namespace
+		podList = append(podList, podBase)
+	}
+	if len(pods) == 0 {
+		return errors.New("no pod found")
+	}
+	var selectPod *querytypes.PodBase
+	if len(pods) > 1 {
+		selectPod, err = AskToChooseOnePod(podList)
+		if err != nil {
+			return err
+		}
+	} else {
+		selectPod = &podList[0]
+	}
+	l := Args{
+		Args:   w.Args,
+		Output: w.Output,
+	}
+	return l.printPodLogs(ctx, ioStreams, selectPod, filters)
+}
+
+func (w *WorkflowArgs) checkWorkflowNotComplete() func(cmd *cobra.Command, args []string) {
+	return func(cmd *cobra.Command, args []string) {
+		if err := w.getWorkflowInstance(context.Background(), cmd, args); err != nil {
+			return
+		}
+		if w.WorkflowInstance.Status.Phase == workflowv1alpha1.WorkflowStateSucceeded {
+			cmd.Printf("%s workflow not allowed because application %s is running\n", cmd.Use, args[0])
+			os.Exit(1)
+		}
+	}
+}
+
+func (w *WorkflowArgs) checkDebugMode() func(cmd *cobra.Command, args []string) {
+	return func(cmd *cobra.Command, args []string) {
+		if err := w.getWorkflowInstance(context.Background(), cmd, args); err != nil {
+			return
+		}
+		if !w.WorkflowInstance.Debug {
+			msg := ""
+			if w.Type == instanceTypeApplication {
+				msg = "please make sure your application have the debug policy, you can add the debug policy by using `vela up -f <app.yaml> --debug"
+			} else {
+				msg = "please make sure your workflow have the debug annotation [workflowrun.oam.dev/debug:true] then re-run the workflow"
+			}
+			cmd.Printf("workflow %s is not in debug mode, %s", w.WorkflowInstance.Name, msg)
+			os.Exit(1)
+		}
+	}
 }

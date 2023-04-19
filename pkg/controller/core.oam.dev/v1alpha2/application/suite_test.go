@@ -37,21 +37,24 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	"k8s.io/utils/pointer"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
-	"sigs.k8s.io/controller-runtime/pkg/envtest/printer"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+
+	"github.com/kubevela/workflow/pkg/cue/packages"
 
 	"github.com/oam-dev/kubevela/apis/core.oam.dev/v1alpha2"
 	"github.com/oam-dev/kubevela/apis/core.oam.dev/v1beta1"
 	"github.com/oam-dev/kubevela/apis/standard.oam.dev/v1alpha1"
 	"github.com/oam-dev/kubevela/pkg/appfile"
-	"github.com/oam-dev/kubevela/pkg/cue/packages"
+	"github.com/oam-dev/kubevela/pkg/features"
+	"github.com/oam-dev/kubevela/pkg/multicluster"
 	"github.com/oam-dev/kubevela/pkg/oam/discoverymapper"
 	// +kubebuilder:scaffold:imports
 )
@@ -72,9 +75,7 @@ var appRevisionLimit = 5
 func TestAPIs(t *testing.T) {
 	RegisterFailHandler(Fail)
 
-	RunSpecsWithDefaultAndCustomReporters(t,
-		"Controller Suite",
-		[]Reporter{printer.NewlineReporter{}})
+	RunSpecs(t, "Controller Suite")
 }
 
 type NoOpReconciler struct {
@@ -100,7 +101,7 @@ var _ = BeforeSuite(func(done Done) {
 	testEnv = &envtest.Environment{
 		ControlPlaneStartTimeout: time.Minute,
 		ControlPlaneStopTimeout:  time.Minute,
-		UseExistingCluster:       pointer.BoolPtr(false),
+		UseExistingCluster:       pointer.Bool(false),
 		CRDDirectoryPaths:        []string{yamlPath, "./testdata/crds/terraform.core.oam.dev_configurations.yaml"},
 	}
 
@@ -154,8 +155,8 @@ var _ = BeforeSuite(func(done Done) {
 		LeaderElectionID:        "test",
 	})
 	Expect(err).NotTo(HaveOccurred())
-	definitonNs := corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "vela-system"}}
-	Expect(k8sClient.Create(context.Background(), definitonNs.DeepCopy())).Should(BeNil())
+	definitionNs := corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "vela-system"}}
+	Expect(k8sClient.Create(context.Background(), definitionNs.DeepCopy())).Should(BeNil())
 
 	var ctx context.Context
 	ctx, controllerDone = context.WithCancel(context.Background())
@@ -165,6 +166,8 @@ var _ = BeforeSuite(func(done Done) {
 		Expect(err).NotTo(HaveOccurred())
 	}()
 	close(done)
+	Expect(utilfeature.DefaultMutableFeatureGate.Set(fmt.Sprintf("%s=true", features.LegacyComponentRevision))).Should(Succeed())
+	multicluster.InitClusterInfo(cfg)
 }, 120)
 
 var _ = AfterSuite(func() {

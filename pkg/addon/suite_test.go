@@ -5,7 +5,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    http://www.apache.org/licenses/LICENSE-2.0
+	http://www.apache.org/licenses/LICENSE-2.0
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -21,28 +21,27 @@ import (
 	"testing"
 	"time"
 
-	"k8s.io/client-go/discovery"
-	ocmclusterv1 "open-cluster-management.io/api/cluster/v1"
-	ocmclusterv1alpha1 "open-cluster-management.io/api/cluster/v1alpha1"
-	ocmworkv1 "open-cluster-management.io/api/work/v1"
-
+	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/gomega"
 	v12 "k8s.io/api/core/v1"
 	crdv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/gomega"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/discovery"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
+	ocmclusterv1 "open-cluster-management.io/api/cluster/v1"
+	ocmclusterv1alpha1 "open-cluster-management.io/api/cluster/v1alpha1"
+	ocmworkv1 "open-cluster-management.io/api/work/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
-	"sigs.k8s.io/controller-runtime/pkg/envtest/printer"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
 	coreoam "github.com/oam-dev/kubevela/apis/core.oam.dev"
-	"github.com/oam-dev/kubevela/pkg/cue/packages"
+
+	"github.com/kubevela/workflow/pkg/cue/packages"
+
 	"github.com/oam-dev/kubevela/pkg/oam/discoverymapper"
 	// +kubebuilder:scaffold:imports
 )
@@ -58,9 +57,7 @@ var dc *discovery.DiscoveryClient
 
 func TestAddon(t *testing.T) {
 	RegisterFailHandler(Fail)
-	RunSpecsWithDefaultAndCustomReporters(t,
-		"Addon Suite test",
-		[]Reporter{printer.NewlineReporter{}})
+	RunSpecs(t, "Addon Suite test")
 }
 
 var _ = BeforeSuite(func(done Done) {
@@ -104,6 +101,9 @@ var _ = BeforeSuite(func(done Done) {
 		&v12.Namespace{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Namespace"}, ObjectMeta: metav1.ObjectMeta{
 			Name: testns,
 		}}))
+
+	err = stepHelmHttpServer()
+	Expect(err).Should(Succeed())
 
 	close(done)
 }, 120)

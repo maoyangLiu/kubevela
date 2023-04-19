@@ -17,89 +17,20 @@ limitations under the License.
 package addon
 
 import (
-	"context"
 	"encoding/base64"
-	"fmt"
-	"io/ioutil"
-	"log"
 	"net/http"
+	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
-	"time"
 
 	"helm.sh/helm/v3/pkg/chart"
 	"helm.sh/helm/v3/pkg/repo"
 
-	"github.com/oam-dev/kubevela/pkg/utils/common"
-
 	"github.com/stretchr/testify/assert"
+
+	"github.com/oam-dev/kubevela/pkg/utils/helm"
 )
-
-func TestVersionRegistry(t *testing.T) {
-	go func() {
-		http.HandleFunc("/", versionedHandler)
-		http.HandleFunc("/authReg", basicAuthVersionedHandler)
-		err := http.ListenAndServe(fmt.Sprintf(":%d", 18083), nil)
-		if err != nil {
-			log.Fatal("Setup server error:", err)
-		}
-	}()
-
-	// wait server setup
-	time.Sleep(3 * time.Second)
-	r := BuildVersionedRegistry("helm-repo", "http://127.0.0.1:18083", nil)
-	addons, err := r.ListAddon()
-	assert.NoError(t, err)
-	assert.Equal(t, len(addons), 1)
-	assert.Equal(t, addons[0].Name, "fluxcd")
-	assert.Equal(t, len(addons[0].AvailableVersions), 1)
-
-	addonUIData, err := r.GetAddonUIData(context.Background(), "fluxcd", "1.0.0")
-	assert.NoError(t, err)
-	assert.NotEmpty(t, addonUIData.Definitions)
-	assert.NotEmpty(t, addonUIData.Icon)
-
-	addonsInstallPackage, err := r.GetAddonInstallPackage(context.Background(), "fluxcd", "1.0.0")
-	assert.NoError(t, err)
-	assert.NotEmpty(t, addonsInstallPackage)
-	assert.NotEmpty(t, addonsInstallPackage.YAMLTemplates)
-	assert.NotEmpty(t, addonsInstallPackage.DefSchemas)
-
-	addonWholePackage, err := r.GetDetailedAddon(context.Background(), "fluxcd", "1.0.0")
-	assert.NoError(t, err)
-	assert.NotEmpty(t, addonWholePackage)
-	assert.NotEmpty(t, addonWholePackage.YAMLTemplates)
-	assert.NotEmpty(t, addonWholePackage.DefSchemas)
-	assert.NotEmpty(t, addonWholePackage.RegistryName)
-
-	ar := BuildVersionedRegistry("auth-helm-repo", "http://127.0.0.1:18083/authReg", &common.HTTPOption{Username: "hello", Password: "hello"})
-	addons, err = ar.ListAddon()
-	assert.NoError(t, err)
-	assert.Equal(t, len(addons), 1)
-	assert.Equal(t, addons[0].Name, "fluxcd")
-	assert.Equal(t, len(addons[0].AvailableVersions), 1)
-
-	addonUIData, err = ar.GetAddonUIData(context.Background(), "fluxcd", "1.0.0")
-	assert.NoError(t, err)
-	assert.NotEmpty(t, addonUIData.Definitions)
-	assert.NotEmpty(t, addonUIData.Icon)
-
-	addonsInstallPackage, err = ar.GetAddonInstallPackage(context.Background(), "fluxcd", "1.0.0")
-	assert.NoError(t, err)
-	assert.NotEmpty(t, addonsInstallPackage)
-	assert.NotEmpty(t, addonsInstallPackage.YAMLTemplates)
-	assert.NotEmpty(t, addonsInstallPackage.DefSchemas)
-
-	addonWholePackage, err = ar.GetDetailedAddon(context.Background(), "fluxcd", "1.0.0")
-	assert.NoError(t, err)
-	assert.NotEmpty(t, addonWholePackage)
-	assert.NotEmpty(t, addonWholePackage.YAMLTemplates)
-	assert.NotEmpty(t, addonWholePackage.DefSchemas)
-	assert.NotEmpty(t, addonWholePackage.RegistryName)
-
-	testListUIData(t)
-
-}
 
 func TestChooseAddonVersion(t *testing.T) {
 	versions := []*repo.ChartVersion{
@@ -131,13 +62,13 @@ func TestChooseAddonVersion(t *testing.T) {
 var versionedHandler http.HandlerFunc = func(writer http.ResponseWriter, request *http.Request) {
 	switch {
 	case strings.Contains(request.URL.Path, "index.yaml"):
-		files, err := ioutil.ReadFile("./testdata/helm-repo/index.yaml")
+		files, err := os.ReadFile("./testdata/helm-repo/index.yaml")
 		if err != nil {
 			_, _ = writer.Write([]byte(err.Error()))
 		}
 		writer.Write(files)
 	case strings.Contains(request.URL.Path, "fluxcd-1.0.0.tgz"):
-		files, err := ioutil.ReadFile("./testdata/helm-repo/fluxcd-1.0.0.tgz")
+		files, err := os.ReadFile("./testdata/helm-repo/fluxcd-1.0.0.tgz")
 		if err != nil {
 			_, _ = writer.Write([]byte(err.Error()))
 		}
@@ -159,16 +90,79 @@ var basicAuthVersionedHandler http.HandlerFunc = func(writer http.ResponseWriter
 	}
 	switch {
 	case strings.Contains(request.URL.Path, "index.yaml"):
-		files, err := ioutil.ReadFile("./testdata/basicauth-helm-repo/index.yaml")
+		files, err := os.ReadFile("./testdata/basicauth-helm-repo/index.yaml")
 		if err != nil {
 			_, _ = writer.Write([]byte(err.Error()))
 		}
 		writer.Write(files)
 	case strings.Contains(request.URL.Path, "fluxcd-1.0.0.tgz"):
-		files, err := ioutil.ReadFile("./testdata/basicauth-helm-repo/fluxcd-1.0.0.tgz")
+		files, err := os.ReadFile("./testdata/basicauth-helm-repo/fluxcd-1.0.0.tgz")
 		if err != nil {
 			_, _ = writer.Write([]byte(err.Error()))
 		}
 		writer.Write(files)
 	}
+}
+
+var multiVersionHandler http.HandlerFunc = func(writer http.ResponseWriter, request *http.Request) {
+	switch {
+	case strings.Contains(request.URL.Path, "index.yaml"):
+		files, err := os.ReadFile("./testdata/multiversion-helm-repo/index.yaml")
+		if err != nil {
+			_, _ = writer.Write([]byte(err.Error()))
+		}
+		writer.Write(files)
+	case strings.Contains(request.URL.Path, "fluxcd-1.0.0.tgz"):
+		files, err := os.ReadFile("./testdata/multiversion-helm-repo/fluxcd-1.0.0.tgz")
+		if err != nil {
+			_, _ = writer.Write([]byte(err.Error()))
+		}
+		writer.Write(files)
+	case strings.Contains(request.URL.Path, "fluxcd-2.0.0.tgz"):
+		files, err := os.ReadFile("./testdata/multiversion-helm-repo/fluxcd-2.0.0.tgz")
+		if err != nil {
+			_, _ = writer.Write([]byte(err.Error()))
+		}
+		writer.Write(files)
+	}
+}
+
+func TestLoadSystemRequirements(t *testing.T) {
+	req := LoadSystemRequirements(map[string]string{velaSystemRequirement: ">=1.3.0", kubernetesSystemRequirement: ">=1.10.0"})
+	assert.Equal(t, req.VelaVersion, ">=1.3.0")
+	assert.Equal(t, req.KubernetesVersion, ">=1.10.0")
+
+	req = LoadSystemRequirements(nil)
+	assert.Empty(t, req)
+
+	req = LoadSystemRequirements(map[string]string{kubernetesSystemRequirement: ">=1.10.0"})
+	assert.Equal(t, req.KubernetesVersion, ">=1.10.0")
+
+	req = LoadSystemRequirements(map[string]string{velaSystemRequirement: ">=1.4.0"})
+	assert.Equal(t, req.VelaVersion, ">=1.4.0")
+}
+
+func TestLoadAddonVersions(t *testing.T) {
+	server := httptest.NewServer(multiVersionHandler)
+	defer server.Close()
+	mr := &versionedRegistry{
+		name: "multiversion-helm-repo",
+		url:  server.URL,
+		h:    helm.NewHelperWithCache(),
+		Opts: nil,
+	}
+	versions, err := mr.loadAddonVersions("not-exist")
+	assert.Error(t, err)
+	assert.Equal(t, err, ErrNotExist)
+	assert.Equal(t, len(versions), 0)
+
+	mr = &versionedRegistry{
+		name: "multiversion-helm-repo",
+		url:  server.URL,
+		h:    helm.NewHelperWithCache(),
+		Opts: nil,
+	}
+	versions, err = mr.loadAddonVersions("not-exist")
+	assert.Error(t, err)
+	assert.Equal(t, len(versions), 0)
 }

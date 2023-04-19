@@ -19,6 +19,7 @@ package component
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 
 	"github.com/pkg/errors"
@@ -32,11 +33,14 @@ import (
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	velaclient "github.com/kubevela/pkg/controller/client"
+
 	"github.com/oam-dev/kubevela/apis/core.oam.dev/common"
 	"github.com/oam-dev/kubevela/apis/core.oam.dev/v1alpha1"
-	velaclient "github.com/oam-dev/kubevela/pkg/client"
 	"github.com/oam-dev/kubevela/pkg/features"
 	"github.com/oam-dev/kubevela/pkg/multicluster"
+	"github.com/oam-dev/kubevela/pkg/oam"
+	utilscommon "github.com/oam-dev/kubevela/pkg/utils/common"
 )
 
 const (
@@ -138,10 +142,18 @@ func SelectRefObjectsForDispatch(ctx context.Context, cli client.Client, appNs s
 	if err != nil {
 		return nil, err
 	}
+	isNamespaced, err := IsGroupVersionKindNamespaceScoped(cli.RESTMapper(), gvk)
+	if err != nil {
+		return nil, err
+	}
 	if selector.Name == "" && labelSelector != nil {
 		uns := &unstructured.UnstructuredList{}
 		uns.SetGroupVersionKind(gvk)
-		if err = cli.List(ctx, uns, client.InNamespace(ns), client.MatchingLabels(labelSelector)); err != nil {
+		opts := []client.ListOption{client.MatchingLabels(labelSelector)}
+		if isNamespaced {
+			opts = append(opts, client.InNamespace(ns))
+		}
+		if err = cli.List(ctx, uns, opts...); err != nil {
 			return nil, errors.Wrapf(err, "failed to load ref object %s with selector", gvk.Kind)
 		}
 		for _, _un := range uns.Items {
@@ -151,7 +163,9 @@ func SelectRefObjectsForDispatch(ctx context.Context, cli client.Client, appNs s
 		un := &unstructured.Unstructured{}
 		un.SetGroupVersionKind(gvk)
 		un.SetName(selector.Name)
-		un.SetNamespace(ns)
+		if isNamespaced {
+			un.SetNamespace(ns)
+		}
 		if selector.Name == "" {
 			un.SetName(compName)
 		}
@@ -168,9 +182,12 @@ func SelectRefObjectsForDispatch(ctx context.Context, cli client.Client, appNs s
 
 // ReferredObjectsDelegatingClient delegate client get/list function by retrieving ref-objects from existing objects
 func ReferredObjectsDelegatingClient(cli client.Client, objs []*unstructured.Unstructured) client.Client {
+	objs = utilscommon.FilterObjectsByCondition(objs, func(obj *unstructured.Unstructured) bool {
+		return obj.GetAnnotations() == nil || obj.GetAnnotations()[oam.AnnotationResourceURL] == ""
+	})
 	return velaclient.DelegatingHandlerClient{
 		Client: cli,
-		Getter: func(ctx context.Context, key client.ObjectKey, obj client.Object) error {
+		Getter: func(ctx context.Context, key client.ObjectKey, obj client.Object, _ ...client.GetOption) error {
 			un, ok := obj.(*unstructured.Unstructured)
 			if !ok {
 				return errors.Errorf("ReferredObjectsDelegatingClient does not support non-unstructured type")
@@ -241,4 +258,16 @@ func ConvertUnstructuredsToReferredObjects(uns []*unstructured.Unstructured) (re
 		refObjs = append(refObjs, common.ReferredObject{RawExtension: runtime.RawExtension{Raw: bs}})
 	}
 	return refObjs, nil
+}
+
+// IsGroupVersionKindNamespaceScoped check if the target GroupVersionKind is namespace scoped resource
+func IsGroupVersionKindNamespaceScoped(mapper meta.RESTMapper, gvk schema.GroupVersionKind) (bool, error) {
+	mappings, err := mapper.RESTMappings(gvk.GroupKind(), gvk.Version)
+	if err != nil {
+		return false, err
+	}
+	if len(mappings) == 0 {
+		return false, fmt.Errorf("unable to fund the mappings for gvk %s", gvk)
+	}
+	return mappings[0].Scope.Name() == meta.RESTScopeNameNamespace, nil
 }

@@ -31,8 +31,6 @@ const defaultVelaHome = ".vela"
 const (
 	// VelaHomeEnv defines vela home system env
 	VelaHomeEnv = "VELA_HOME"
-	// StorageDriverEnv defines vela storage driver env
-	StorageDriverEnv = "STORAGE_DRIVER"
 )
 
 // GetVelaHomeDir return vela home dir
@@ -167,5 +165,5 @@ func bindEnv(variable *string, keys ...string) {
 // BindEnvironmentVariables bind
 func BindEnvironmentVariables() {
 	bindEnv(&types.DefaultKubeVelaNS, KubeVelaSystemNamespaceEnv, LegacyKubeVelaSystemNamespaceEnv)
-	bindEnv(&oam.SystemDefinitonNamespace, KubeVelaDefinitionNamespaceEnv, KubeVelaSystemNamespaceEnv)
+	bindEnv(&oam.SystemDefinitionNamespace, KubeVelaDefinitionNamespaceEnv, KubeVelaSystemNamespaceEnv)
 }

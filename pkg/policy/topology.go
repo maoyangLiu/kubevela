@@ -18,7 +18,9 @@ package policy
 
 import (
 	"context"
+	"fmt"
 
+	pkgmulticluster "github.com/kubevela/pkg/multicluster"
 	"github.com/pkg/errors"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -43,11 +45,11 @@ func GetClusterLabelSelectorInTopology(topology *v1alpha1.TopologyPolicySpec) ma
 
 // GetPlacementsFromTopologyPolicies get placements from topology policies with provided client
 func GetPlacementsFromTopologyPolicies(ctx context.Context, cli client.Client, appNs string, policies []v1beta1.AppPolicy, allowCrossNamespace bool) ([]v1alpha1.PlacementDecision, error) {
-	var placements []v1alpha1.PlacementDecision
+	placements := make([]v1alpha1.PlacementDecision, 0)
 	placementMap := map[string]struct{}{}
 	addCluster := func(cluster string, ns string, validateCluster bool) error {
 		if validateCluster {
-			if _, e := multicluster.GetVirtualCluster(ctx, cli, cluster); e != nil {
+			if _, e := multicluster.NewClusterClient(cli).Get(ctx, cluster); e != nil {
 				return errors.Wrapf(e, "failed to get cluster %s", cluster)
 			}
 		}
@@ -65,6 +67,9 @@ func GetPlacementsFromTopologyPolicies(ctx context.Context, cli client.Client, a
 	hasTopologyPolicy := false
 	for _, policy := range policies {
 		if policy.Type == v1alpha1.TopologyPolicyType {
+			if policy.Properties == nil {
+				return nil, fmt.Errorf("topology policy %s must not have empty properties", policy.Name)
+			}
 			hasTopologyPolicy = true
 			topologySpec := &v1alpha1.TopologyPolicySpec{}
 			if err := utils.StrictUnmarshal(policy.Properties.Raw, topologySpec); err != nil {
@@ -79,17 +84,21 @@ func GetPlacementsFromTopologyPolicies(ctx context.Context, cli client.Client, a
 					}
 				}
 			case clusterLabelSelector != nil:
-				clusters, err := multicluster.FindVirtualClustersByLabels(context.Background(), cli, clusterLabelSelector)
+				clusterList, err := multicluster.NewClusterClient(cli).List(ctx, client.MatchingLabels(clusterLabelSelector))
 				if err != nil {
 					return nil, errors.Wrapf(err, "failed to find clusters in topology %s", policy.Name)
 				}
-				if len(clusters) == 0 {
+				if len(clusterList.Items) == 0 && !topologySpec.AllowEmpty {
 					return nil, errors.New("failed to find any cluster matches given labels")
 				}
-				for _, cluster := range clusters {
+				for _, cluster := range clusterList.Items {
 					if err = addCluster(cluster.Name, topologySpec.Namespace, false); err != nil {
 						return nil, err
 					}
+				}
+			default:
+				if err := addCluster(pkgmulticluster.Local, topologySpec.Namespace, false); err != nil {
+					return nil, err
 				}
 			}
 		}

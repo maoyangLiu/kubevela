@@ -17,21 +17,25 @@ limitations under the License.
 package addon
 
 import (
+	"fmt"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
-	"github.com/stretchr/testify/assert"
-
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
+	"github.com/stretchr/testify/assert"
+	"helm.sh/helm/v3/pkg/chartutil"
 	v1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"sigs.k8s.io/yaml"
 
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-
+	"github.com/oam-dev/kubevela/apis/core.oam.dev/common"
 	"github.com/oam-dev/kubevela/apis/core.oam.dev/v1beta1"
 	velatypes "github.com/oam-dev/kubevela/apis/types"
 	"github.com/oam-dev/kubevela/pkg/oam"
@@ -107,9 +111,13 @@ var _ = Describe("Test definition check", func() {
 		Expect(yaml.Unmarshal([]byte(testApp3Yaml), &app3)).Should(BeNil())
 		Expect(k8sClient.Create(ctx, &app3)).Should(BeNil())
 
+		app4 := v1beta1.Application{}
+		Expect(yaml.Unmarshal([]byte(testApp4Yaml), &app4)).Should(BeNil())
+		Expect(k8sClient.Create(ctx, &app4)).Should(BeNil())
+
 		usedApps, err := checkAddonHasBeenUsed(ctx, k8sClient, "my-addon", addonApp, cfg)
 		Expect(err).Should(BeNil())
-		Expect(len(usedApps)).Should(BeEquivalentTo(3))
+		Expect(len(usedApps)).Should(BeEquivalentTo(4))
 	})
 
 	It("check fetch lagacy addon definitions", func() {
@@ -146,12 +154,278 @@ func TestMerge2Map(t *testing.T) {
 
 func TestUsingAddonInfo(t *testing.T) {
 	apps := []v1beta1.Application{
-		v1beta1.Application{ObjectMeta: metav1.ObjectMeta{Namespace: "namespace-1", Name: "app-1"}},
-		v1beta1.Application{ObjectMeta: metav1.ObjectMeta{Namespace: "namespace-2", Name: "app-2"}},
-		v1beta1.Application{ObjectMeta: metav1.ObjectMeta{Namespace: "namespace-1", Name: "app-3"}},
+		{ObjectMeta: metav1.ObjectMeta{Namespace: "namespace-1", Name: "app-1"}},
+		{ObjectMeta: metav1.ObjectMeta{Namespace: "namespace-2", Name: "app-2"}},
+		{ObjectMeta: metav1.ObjectMeta{Namespace: "namespace-1", Name: "app-3"}},
+		{ObjectMeta: metav1.ObjectMeta{Namespace: "namespace-3", Name: "app-3"}},
 	}
-	res := usingAppsInfo(apps)
-	assert.Equal(t, true, strings.Contains(res, "Please delete them before disabling the addon"))
+	res := appsDependsOnAddonErrInfo(apps)
+	assert.Contains(t, res, "and other 1 more applications. Please delete all of them before removing.")
+
+	apps = []v1beta1.Application{
+		{ObjectMeta: metav1.ObjectMeta{Namespace: "namespace-1", Name: "app-1"}},
+		{ObjectMeta: metav1.ObjectMeta{Namespace: "namespace-2", Name: "app-2"}},
+		{ObjectMeta: metav1.ObjectMeta{Namespace: "namespace-1", Name: "app-3"}},
+	}
+	res = appsDependsOnAddonErrInfo(apps)
+	assert.Contains(t, res, "Please delete all of them before removing.")
+
+	apps = []v1beta1.Application{
+		{ObjectMeta: metav1.ObjectMeta{Namespace: "namespace-1", Name: "app-1"}},
+	}
+	res = appsDependsOnAddonErrInfo(apps)
+	assert.Contains(t, res, "this addon is being used by: namespace-1/app-1 applications. Please delete all of them before removing.")
+
+	apps = []v1beta1.Application{
+		{ObjectMeta: metav1.ObjectMeta{Namespace: "namespace-1", Name: "app-1"}},
+		{ObjectMeta: metav1.ObjectMeta{Namespace: "namespace-2", Name: "app-2"}},
+	}
+	res = appsDependsOnAddonErrInfo(apps)
+	assert.Contains(t, res, ". Please delete all of them before removing.")
+}
+
+func TestIsAddonDir(t *testing.T) {
+	var isAddonDir bool
+	var err error
+	var meta *Meta
+	var metaYaml []byte
+
+	// Non-existent dir
+	isAddonDir, err = IsAddonDir("non-existent-dir")
+	assert.Equal(t, isAddonDir, false)
+	assert.Error(t, err)
+
+	// Not a directory (a file)
+	isAddonDir, err = IsAddonDir(filepath.Join("testdata", "local", "metadata.yaml"))
+	assert.Equal(t, isAddonDir, false)
+	assert.Contains(t, err.Error(), "not a directory")
+
+	// No metadata.yaml
+	isAddonDir, err = IsAddonDir(".")
+	assert.Equal(t, isAddonDir, false)
+	assert.Contains(t, err.Error(), "exists in directory")
+
+	// Empty metadata.yaml
+	err = os.MkdirAll(filepath.Join("testdata", "testaddon"), 0700)
+	assert.NoError(t, err)
+	defer func() {
+		os.RemoveAll(filepath.Join("testdata", "testaddon"))
+	}()
+	err = os.WriteFile(filepath.Join("testdata", "testaddon", MetadataFileName), []byte{}, 0644)
+	assert.NoError(t, err)
+	isAddonDir, err = IsAddonDir(filepath.Join("testdata", "testaddon"))
+	assert.Equal(t, isAddonDir, false)
+	assert.Contains(t, err.Error(), "missing")
+
+	// Empty addon name
+	meta = &Meta{}
+	metaYaml, err = yaml.Marshal(meta)
+	assert.NoError(t, err)
+	err = os.WriteFile(filepath.Join("testdata", "testaddon", MetadataFileName), metaYaml, 0644)
+	assert.NoError(t, err)
+	isAddonDir, err = IsAddonDir(filepath.Join("testdata", "testaddon"))
+	assert.Equal(t, isAddonDir, false)
+	assert.Contains(t, err.Error(), "addon name is empty")
+
+	// Empty addon version
+	meta = &Meta{
+		Name: "name",
+	}
+	metaYaml, err = yaml.Marshal(meta)
+	assert.NoError(t, err)
+	err = os.WriteFile(filepath.Join("testdata", "testaddon", MetadataFileName), metaYaml, 0644)
+	assert.NoError(t, err)
+	isAddonDir, err = IsAddonDir(filepath.Join("testdata", "testaddon"))
+	assert.Equal(t, isAddonDir, false)
+	assert.Contains(t, err.Error(), "addon version is empty")
+
+	// No metadata.yaml
+	meta = &Meta{
+		Name:    "name",
+		Version: "1.0.0",
+	}
+	metaYaml, err = yaml.Marshal(meta)
+	assert.NoError(t, err)
+	err = os.WriteFile(filepath.Join("testdata", "testaddon", MetadataFileName), metaYaml, 0644)
+	assert.NoError(t, err)
+	isAddonDir, err = IsAddonDir(filepath.Join("testdata", "testaddon"))
+	assert.Equal(t, isAddonDir, false)
+	assert.Contains(t, err.Error(), "exists in directory")
+
+	// Empty template.yaml
+	err = os.WriteFile(filepath.Join("testdata", "testaddon", TemplateFileName), []byte{}, 0644)
+	assert.NoError(t, err)
+	isAddonDir, err = IsAddonDir(filepath.Join("testdata", "testaddon"))
+	assert.Equal(t, isAddonDir, false)
+	assert.Contains(t, err.Error(), "missing")
+
+	// Empty template.cue
+	err = os.WriteFile(filepath.Join("testdata", "testaddon", AppTemplateCueFileName), []byte{}, 0644)
+	assert.NoError(t, err)
+	isAddonDir, err = IsAddonDir(filepath.Join("testdata", "testaddon"))
+	assert.Equal(t, isAddonDir, false)
+	assert.Contains(t, err.Error(), renderOutputCuePath)
+
+	// Pass all checks
+	cmd := InitCmd{
+		Path:      filepath.Join("testdata", "testaddon2"),
+		AddonName: "testaddon2",
+	}
+	err = cmd.CreateScaffold()
+	assert.NoError(t, err)
+	defer func() {
+		_ = os.RemoveAll(filepath.Join("testdata", "testaddon2"))
+	}()
+	isAddonDir, err = IsAddonDir(filepath.Join("testdata", "testaddon2"))
+	assert.Equal(t, isAddonDir, true)
+	assert.NoError(t, err)
+}
+
+func TestMakeChart(t *testing.T) {
+	var err error
+
+	// Not a addon dir
+	err = MakeChartCompatible(".", true)
+	assert.Contains(t, err.Error(), "not an addon dir")
+
+	// Valid addon dir
+	cmd := InitCmd{
+		Path:      filepath.Join("testdata", "testaddon"),
+		AddonName: "testaddon",
+	}
+	err = cmd.CreateScaffold()
+	assert.NoError(t, err)
+	defer func() {
+		_ = os.RemoveAll(filepath.Join("testdata", "testaddon"))
+	}()
+	err = MakeChartCompatible(filepath.Join("testdata", "testaddon"), true)
+	assert.NoError(t, err)
+	isChartDir, err := chartutil.IsChartDir(filepath.Join("testdata", "testaddon"))
+	assert.NoError(t, err)
+	assert.Equal(t, isChartDir, true)
+
+	// Already a chart dir
+	err = MakeChartCompatible(filepath.Join("testdata", "testaddon"), false)
+	assert.NoError(t, err)
+	isChartDir, err = chartutil.IsChartDir(filepath.Join("testdata", "testaddon"))
+	assert.NoError(t, err)
+	assert.Equal(t, isChartDir, true)
+}
+
+func TestCheckObjectBindingComponent(t *testing.T) {
+	existingBindingDef := unstructured.Unstructured{}
+	existingBindingDef.SetAnnotations(map[string]string{oam.AnnotationAddonDefinitionBondCompKey: "kustomize"})
+
+	emptyAnnoDef := unstructured.Unstructured{}
+	emptyAnnoDef.SetAnnotations(map[string]string{"test": "onlyForTest"})
+
+	legacyAnnoDef := unstructured.Unstructured{}
+	legacyAnnoDef.SetAnnotations(map[string]string{oam.AnnotationIgnoreWithoutCompKey: "kustomize"})
+	testCases := map[string]struct {
+		object unstructured.Unstructured
+		app    v1beta1.Application
+		res    bool
+	}{
+		"bindingExist": {object: existingBindingDef,
+			app: v1beta1.Application{Spec: v1beta1.ApplicationSpec{Components: []common.ApplicationComponent{{Name: "kustomize"}}}},
+			res: true},
+		"NotExisting": {object: existingBindingDef,
+			app: v1beta1.Application{Spec: v1beta1.ApplicationSpec{Components: []common.ApplicationComponent{{Name: "helm"}}}},
+			res: false},
+		"NoBidingAnnotation": {object: emptyAnnoDef,
+			app: v1beta1.Application{Spec: v1beta1.ApplicationSpec{Components: []common.ApplicationComponent{{Name: "kustomize"}}}},
+			res: true},
+		"EmptyApp": {object: existingBindingDef,
+			app: v1beta1.Application{Spec: v1beta1.ApplicationSpec{Components: []common.ApplicationComponent{}}},
+			res: false},
+		"LegacyApp": {object: legacyAnnoDef,
+			app: v1beta1.Application{Spec: v1beta1.ApplicationSpec{Components: []common.ApplicationComponent{{Name: "kustomize"}}}},
+			res: true,
+		},
+		"LegacyAppWithoutComp": {object: legacyAnnoDef,
+			app: v1beta1.Application{Spec: v1beta1.ApplicationSpec{Components: []common.ApplicationComponent{{}}}},
+			res: false,
+		},
+	}
+	for _, s := range testCases {
+		result := checkBondComponentExist(s.object, s.app)
+		assert.Equal(t, result, s.res)
+	}
+}
+
+func TestFilterDependencyRegistries(t *testing.T) {
+	testCases := []struct {
+		registries []Registry
+		index      int
+		res        []Registry
+		origin     []Registry
+	}{
+		{
+			registries: []Registry{{Name: "r1"}, {Name: "r2"}, {Name: "r3"}},
+			index:      0,
+			res:        []Registry{{Name: "r2"}, {Name: "r3"}},
+			origin:     []Registry{{Name: "r1"}, {Name: "r2"}, {Name: "r3"}},
+		},
+		{
+			registries: []Registry{{Name: "r1"}, {Name: "r2"}, {Name: "r3"}},
+			index:      1,
+			res:        []Registry{{Name: "r1"}, {Name: "r3"}},
+			origin:     []Registry{{Name: "r1"}, {Name: "r2"}, {Name: "r3"}},
+		},
+		{
+			registries: []Registry{{Name: "r1"}, {Name: "r2"}, {Name: "r3"}},
+			index:      2,
+			res:        []Registry{{Name: "r1"}, {Name: "r2"}},
+			origin:     []Registry{{Name: "r1"}, {Name: "r2"}, {Name: "r3"}},
+		},
+		{
+			registries: []Registry{{Name: "r1"}, {Name: "r2"}, {Name: "r3"}},
+			index:      3,
+			res:        []Registry{{Name: "r1"}, {Name: "r2"}, {Name: "r3"}},
+			origin:     []Registry{{Name: "r1"}, {Name: "r2"}, {Name: "r3"}},
+		},
+		{
+			registries: []Registry{{Name: "r1"}, {Name: "r2"}, {Name: "r3"}},
+			index:      -1,
+			res:        []Registry{{Name: "r1"}, {Name: "r2"}, {Name: "r3"}},
+			origin:     []Registry{{Name: "r1"}, {Name: "r2"}, {Name: "r3"}},
+		},
+		{
+			registries: []Registry{},
+			index:      0,
+			res:        []Registry{},
+			origin:     []Registry{},
+		},
+	}
+	for _, testCase := range testCases {
+		res := FilterDependencyRegistries(testCase.index, testCase.registries)
+		assert.Equal(t, res, testCase.res)
+		assert.Equal(t, testCase.registries, testCase.origin)
+	}
+}
+
+func TestCheckAddonPackageValid(t *testing.T) {
+	testCases := []struct {
+		testCase Meta
+		err      error
+	}{{
+		testCase: Meta{},
+		err:      fmt.Errorf("the addon package doesn't have `metadata.yaml`"),
+	}, {
+		testCase: Meta{Version: "v1.4.0"},
+		err:      fmt.Errorf("`matadata.yaml` must define the name of addon"),
+	}, {
+		testCase: Meta{Name: "test-addon"},
+		err:      fmt.Errorf("`matadata.yaml` must define the version of addon"),
+	}, {
+		testCase: Meta{Name: "test-addon", Version: "1.4.5"},
+		err:      nil,
+	},
+	}
+	for _, testCase := range testCases {
+		err := validateAddonPackage(&InstallPackage{Meta: testCase.testCase})
+		assert.Equal(t, reflect.DeepEqual(err, testCase.err), true)
+	}
 }
 
 const (
@@ -190,6 +464,7 @@ metadata:
     addon.oam.dev/componentDefinitions: "my-comp"
     addon.oam.dev/traitDefinitions: "my-trait"
     addon.oam.dev/workflowStepDefinitions: "my-wfstep"
+    addon.oam.dev/policyDefinitions: "my-policy"
   name: addon-myaddon
   namespace: vela-system
 spec:
@@ -238,6 +513,22 @@ spec:
     - type: my-wfstep
       name: deploy
 `
+	testApp4Yaml = `
+apiVersion: core.oam.dev/v1beta1
+kind: Application
+metadata:
+  name: app-4
+  namespace: test-ns
+spec:
+  components:
+    - name: podinfo
+      type: webservice
+
+  policies:
+    - type: my-policy
+      name: topology
+`
+
 	registryCmYaml = `
 apiVersion: v1
 data:

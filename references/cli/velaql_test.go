@@ -17,16 +17,21 @@ limitations under the License.
 package cli
 
 import (
+	"bytes"
 	"context"
 	"fmt"
-	"io/ioutil"
+	"os"
+	"strconv"
 	"strings"
+	"time"
 
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
+	"github.com/spf13/cobra"
 	corev1 "k8s.io/api/core/v1"
-	networkv1beta1 "k8s.io/api/networking/v1beta1"
+	networkv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	pkgtypes "k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/yaml"
@@ -38,6 +43,43 @@ import (
 	"github.com/oam-dev/kubevela/pkg/oam"
 	common2 "github.com/oam-dev/kubevela/pkg/utils/common"
 )
+
+var _ = Describe("Test velaQL from file", func() {
+	It("Test Query pod data", func() {
+		cm := &corev1.ConfigMap{Data: map[string]string{"key": "my-value"}}
+		cm.Name = "mycm"
+		cm.Namespace = "default"
+		Expect(k8sClient.Create(context.TODO(), cm)).Should(BeNil())
+		view := `import (
+	"vela/ql"
+)
+configmap: ql.#Read & {
+   value: {
+      kind: "ConfigMap"
+      apiVersion: "v1"
+      metadata: {
+        name: "mycm"
+      }
+   }
+}
+status: configmap.value.data.key
+
+export: "status"
+`
+		name := "vela-test-" + strconv.FormatInt(time.Now().UnixNano(), 10) + ".cue"
+		Expect(os.WriteFile(name, []byte(view), 0644)).Should(BeNil())
+		defer os.Remove(name)
+
+		arg := common2.Args{}
+		arg.SetConfig(cfg)
+		arg.SetClient(k8sClient)
+		cmd := NewCommand()
+		var buff = bytes.NewBufferString("")
+		cmd.SetOut(buff)
+		Expect(queryFromView(context.TODO(), arg, name, cmd)).Should(BeNil())
+		Expect(strings.TrimSpace(buff.String())).Should(BeEquivalentTo("my-value"))
+	})
+})
 
 var _ = Describe("Test velaQL", func() {
 	var appName = "test-velaql"
@@ -98,17 +140,19 @@ var _ = Describe("Test velaQL", func() {
 				{
 					Cluster: "",
 					ObjectReference: corev1.ObjectReference{
-						Kind:      "Service",
-						Namespace: "default",
-						Name:      "nodeport",
+						Kind:       "Service",
+						Namespace:  "default",
+						Name:       "nodeport",
+						APIVersion: "v1",
 					},
 				},
 				{
 					Cluster: "",
 					ObjectReference: corev1.ObjectReference{
-						Kind:      "Service",
-						Namespace: "default",
-						Name:      "loadbalancer",
+						Kind:       "Service",
+						Namespace:  "default",
+						Name:       "loadbalancer",
+						APIVersion: "v1",
 					},
 				},
 				{
@@ -170,8 +214,8 @@ var _ = Describe("Test velaQL", func() {
 			{
 				"name": "loadbalancer",
 				"ports": []corev1.ServicePort{
-					{Port: 80, TargetPort: intstr.FromInt(80), Name: "80port"},
-					{Port: 81, TargetPort: intstr.FromInt(81), Name: "81port"},
+					{Port: 80, TargetPort: intstr.FromInt(80), Name: "80port", NodePort: 30180},
+					{Port: 81, TargetPort: intstr.FromInt(81), Name: "81port", NodePort: 30181},
 				},
 				"type": corev1.ServiceTypeLoadBalancer,
 				"status": corev1.ServiceStatus{
@@ -222,25 +266,29 @@ var _ = Describe("Test velaQL", func() {
 				Expect(err).Should(BeNil())
 			}
 		}
-		var prefixbeta = networkv1beta1.PathTypePrefix
+		var prefixbeta = networkv1.PathTypePrefix
 		testIngress := []client.Object{
-			&networkv1beta1.Ingress{
+			&networkv1.Ingress{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "ingress-http",
 					Namespace: "default",
 				},
-				Spec: networkv1beta1.IngressSpec{
-					Rules: []networkv1beta1.IngressRule{
+				Spec: networkv1.IngressSpec{
+					Rules: []networkv1.IngressRule{
 						{
 							Host: "ingress.domain",
-							IngressRuleValue: networkv1beta1.IngressRuleValue{
-								HTTP: &networkv1beta1.HTTPIngressRuleValue{
-									Paths: []networkv1beta1.HTTPIngressPath{
+							IngressRuleValue: networkv1.IngressRuleValue{
+								HTTP: &networkv1.HTTPIngressRuleValue{
+									Paths: []networkv1.HTTPIngressPath{
 										{
 											Path: "/",
-											Backend: networkv1beta1.IngressBackend{
-												ServiceName: "clusterip",
-												ServicePort: intstr.FromInt(80),
+											Backend: networkv1.IngressBackend{
+												Service: &networkv1.IngressServiceBackend{
+													Name: "clusterip",
+													Port: networkv1.ServiceBackendPort{
+														Number: 80,
+													},
+												},
 											},
 											PathType: &prefixbeta,
 										},
@@ -251,28 +299,32 @@ var _ = Describe("Test velaQL", func() {
 					},
 				},
 			},
-			&networkv1beta1.Ingress{
+			&networkv1.Ingress{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "ingress-https",
 					Namespace: "default",
 				},
-				Spec: networkv1beta1.IngressSpec{
-					TLS: []networkv1beta1.IngressTLS{
+				Spec: networkv1.IngressSpec{
+					TLS: []networkv1.IngressTLS{
 						{
 							SecretName: "https-secret",
 						},
 					},
-					Rules: []networkv1beta1.IngressRule{
+					Rules: []networkv1.IngressRule{
 						{
 							Host: "ingress.domain.https",
-							IngressRuleValue: networkv1beta1.IngressRuleValue{
-								HTTP: &networkv1beta1.HTTPIngressRuleValue{
-									Paths: []networkv1beta1.HTTPIngressPath{
+							IngressRuleValue: networkv1.IngressRuleValue{
+								HTTP: &networkv1.HTTPIngressRuleValue{
+									Paths: []networkv1.HTTPIngressPath{
 										{
 											Path: "/",
-											Backend: networkv1beta1.IngressBackend{
-												ServiceName: "clusterip",
-												ServicePort: intstr.FromInt(80),
+											Backend: networkv1.IngressBackend{
+												Service: &networkv1.IngressServiceBackend{
+													Name: "clusterip",
+													Port: networkv1.ServiceBackendPort{
+														Number: 80,
+													},
+												},
 											},
 											PathType: &prefixbeta,
 										},
@@ -283,36 +335,44 @@ var _ = Describe("Test velaQL", func() {
 					},
 				},
 			},
-			&networkv1beta1.Ingress{
+			&networkv1.Ingress{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "ingress-paths",
 					Namespace: "default",
 				},
-				Spec: networkv1beta1.IngressSpec{
-					TLS: []networkv1beta1.IngressTLS{
+				Spec: networkv1.IngressSpec{
+					TLS: []networkv1.IngressTLS{
 						{
 							SecretName: "https-secret",
 						},
 					},
-					Rules: []networkv1beta1.IngressRule{
+					Rules: []networkv1.IngressRule{
 						{
 							Host: "ingress.domain.path",
-							IngressRuleValue: networkv1beta1.IngressRuleValue{
-								HTTP: &networkv1beta1.HTTPIngressRuleValue{
-									Paths: []networkv1beta1.HTTPIngressPath{
+							IngressRuleValue: networkv1.IngressRuleValue{
+								HTTP: &networkv1.HTTPIngressRuleValue{
+									Paths: []networkv1.HTTPIngressPath{
 										{
 											Path: "/test",
-											Backend: networkv1beta1.IngressBackend{
-												ServiceName: "clusterip",
-												ServicePort: intstr.FromInt(80),
+											Backend: networkv1.IngressBackend{
+												Service: &networkv1.IngressServiceBackend{
+													Name: "clusterip",
+													Port: networkv1.ServiceBackendPort{
+														Number: 80,
+													},
+												},
 											},
 											PathType: &prefixbeta,
 										},
 										{
 											Path: "/test2",
-											Backend: networkv1beta1.IngressBackend{
-												ServiceName: "clusterip",
-												ServicePort: intstr.FromInt(80),
+											Backend: networkv1.IngressBackend{
+												Service: &networkv1.IngressServiceBackend{
+													Name: "clusterip",
+													Port: networkv1.ServiceBackendPort{
+														Number: 80,
+													},
+												},
 											},
 											PathType: &prefixbeta,
 										},
@@ -323,7 +383,7 @@ var _ = Describe("Test velaQL", func() {
 					},
 				},
 			},
-			&networkv1beta1.Ingress{
+			&networkv1.Ingress{
 				TypeMeta: metav1.TypeMeta{
 					APIVersion: "networking.k8s.io/v1beta1",
 				},
@@ -335,18 +395,22 @@ var _ = Describe("Test velaQL", func() {
 						"helm.toolkit.fluxcd.io/namespace": "default",
 					},
 				},
-				Spec: networkv1beta1.IngressSpec{
-					Rules: []networkv1beta1.IngressRule{
+				Spec: networkv1.IngressSpec{
+					Rules: []networkv1.IngressRule{
 						{
 							Host: "ingress.domain.helm",
-							IngressRuleValue: networkv1beta1.IngressRuleValue{
-								HTTP: &networkv1beta1.HTTPIngressRuleValue{
-									Paths: []networkv1beta1.HTTPIngressPath{
+							IngressRuleValue: networkv1.IngressRuleValue{
+								HTTP: &networkv1.HTTPIngressRuleValue{
+									Paths: []networkv1.HTTPIngressPath{
 										{
 											Path: "/",
-											Backend: networkv1beta1.IngressBackend{
-												ServiceName: "clusterip",
-												ServicePort: intstr.FromInt(80),
+											Backend: networkv1.IngressBackend{
+												Service: &networkv1.IngressServiceBackend{
+													Name: "clusterip",
+													Port: networkv1.ServiceBackendPort{
+														Number: 80,
+													},
+												},
 											},
 											PathType: &prefixbeta,
 										},
@@ -375,7 +439,7 @@ var _ = Describe("Test velaQL", func() {
 				}
 			}
 		}
-		velaQL, err := ioutil.ReadFile("../../charts/vela-core/templates/velaql/endpoints.yaml")
+		velaQL, err := os.ReadFile("../../charts/vela-core/templates/velaql/endpoints.yaml")
 		Expect(err).Should(BeNil())
 		velaQLYaml := strings.Replace(string(velaQL), "{{ include \"systemDefinitionNamespace\" . }}", types.DefaultKubeVelaNS, 1)
 		var cm corev1.ConfigMap
@@ -383,7 +447,7 @@ var _ = Describe("Test velaQL", func() {
 		Expect(err).Should(BeNil())
 		err = k8sClient.Create(context.Background(), &cm)
 		Expect(err).Should(BeNil())
-		endpoints, err := GetServiceEndpoints(context.TODO(), k8sClient, appName, namespace, arg, Filter{})
+		endpoints, err := GetServiceEndpoints(context.TODO(), appName, namespace, arg, Filter{})
 		Expect(err).Should(BeNil())
 		urls := []string{
 			"http://ingress.domain",
@@ -402,5 +466,80 @@ var _ = Describe("Test velaQL", func() {
 		for i, endpoint := range endpoints {
 			Expect(endpoint.String()).Should(BeEquivalentTo(urls[i]))
 		}
+	})
+})
+
+func getViewConfigMap(name string) (*corev1.ConfigMap, error) {
+	cm := &corev1.ConfigMap{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "v1",
+			Kind:       "ConfigMap",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: types.DefaultKubeVelaNS,
+		},
+	}
+
+	err := k8sClient.Get(context.TODO(), pkgtypes.NamespacedName{
+		Namespace: cm.GetNamespace(),
+		Name:      cm.GetName(),
+	}, cm)
+
+	if err != nil {
+		return nil, err
+	}
+
+	return cm, nil
+}
+
+var _ = Describe("test NewQLApplyCommand", func() {
+	var c common2.Args
+	var cmd *cobra.Command
+
+	BeforeEach(func() {
+		c.SetClient(k8sClient)
+		c.SetConfig(cfg)
+		cmd = NewQLApplyCommand(c)
+	})
+
+	It("no parameter provided", func() {
+		cmd.SetArgs([]string{})
+		err := cmd.Execute()
+		Expect(err).ToNot(Succeed())
+		Expect(err.Error()).To(ContainSubstring("no cue"))
+	})
+
+	Context("from stdin", func() {
+		It("no view name specified", func() {
+			cmd.SetArgs([]string{"-f", "-"})
+			err := cmd.Execute()
+			Expect(err).ToNot(Succeed())
+			Expect(err.Error()).To(ContainSubstring("no view name"))
+		})
+	})
+
+	Context("from file", func() {
+		It("no view name specified, inferred from filename", func() {
+			cueStr := "something: {}\nstatus: something"
+			filename := "test-view" + strconv.FormatInt(time.Now().UnixNano(), 10) + ".cue"
+			err := os.WriteFile(filename, []byte(cueStr), 0600)
+			Expect(err).Should(Succeed())
+			defer os.RemoveAll(filename)
+			cmd.SetArgs([]string{"-f", filename})
+			err = cmd.Execute()
+			Expect(err).To(Succeed())
+			_, err = getViewConfigMap(strings.TrimSuffix(filename, ".cue"))
+			Expect(err).To(Succeed())
+		})
+	})
+
+	Context("from URL", func() {
+		It("invalid name inferred", func() {
+			cmd.SetArgs([]string{"-f", "https://some.com"})
+			err := cmd.Execute()
+			Expect(err).ToNot(Succeed())
+			Expect(err.Error()).To(ContainSubstring("view name should only"))
+		})
 	})
 })

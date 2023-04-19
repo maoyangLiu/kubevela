@@ -47,6 +47,7 @@ func TestGetClusterLabelSelectorInTopology(t *testing.T) {
 			Name:      "cluster-a",
 			Namespace: multicluster.ClusterGatewaySecretNamespace,
 			Labels: map[string]string{
+				clustercommon.LabelKeyClusterEndpointType:   string(clusterv1alpha1.ClusterEndpointTypeConst),
 				clustercommon.LabelKeyClusterCredentialType: string(clusterv1alpha1.CredentialTypeX509Certificate),
 				"key": "value",
 			},
@@ -56,6 +57,7 @@ func TestGetClusterLabelSelectorInTopology(t *testing.T) {
 			Name:      "cluster-b",
 			Namespace: multicluster.ClusterGatewaySecretNamespace,
 			Labels: map[string]string{
+				clustercommon.LabelKeyClusterEndpointType:   string(clusterv1alpha1.ClusterEndpointTypeConst),
 				clustercommon.LabelKeyClusterCredentialType: string(clusterv1alpha1.CredentialTypeX509Certificate),
 				"key": "value",
 			},
@@ -65,6 +67,7 @@ func TestGetClusterLabelSelectorInTopology(t *testing.T) {
 			Name:      "cluster-c",
 			Namespace: multicluster.ClusterGatewaySecretNamespace,
 			Labels: map[string]string{
+				clustercommon.LabelKeyClusterEndpointType:   string(clusterv1alpha1.ClusterEndpointTypeConst),
 				clustercommon.LabelKeyClusterCredentialType: string(clusterv1alpha1.CredentialTypeX509Certificate),
 				"key": "none",
 			},
@@ -109,6 +112,14 @@ func TestGetClusterLabelSelectorInTopology(t *testing.T) {
 			}},
 			Error: "failed to find any cluster matches given labels",
 		},
+		"topology-by-cluster-selector-ignore-404": {
+			Inputs: []v1beta1.AppPolicy{{
+				Name:       "topology-policy",
+				Type:       "topology",
+				Properties: &runtime.RawExtension{Raw: []byte(`{"clusterSelector":{"key":"bad-value"},"allowEmpty":true}`)},
+			}},
+			Outputs: []v1alpha1.PlacementDecision{},
+		},
 		"topology-by-cluster-selector": {
 			Inputs: []v1beta1.AppPolicy{{
 				Name:       "topology-policy",
@@ -142,9 +153,22 @@ func TestGetClusterLabelSelectorInTopology(t *testing.T) {
 			Outputs:             []v1alpha1.PlacementDecision{{Cluster: "cluster-a", Namespace: "override"}, {Cluster: "cluster-b", Namespace: "override"}},
 			AllowCrossNamespace: true,
 		},
+		"topology-no-clusters-and-cluster-label-selector": {
+			Inputs: []v1beta1.AppPolicy{{
+				Name:       "topology-policy",
+				Type:       "topology",
+				Properties: &runtime.RawExtension{Raw: []byte(`{"namespace":"override"}`)},
+			}},
+			Outputs:             []v1alpha1.PlacementDecision{{Cluster: "local", Namespace: "override"}},
+			AllowCrossNamespace: true,
+		},
 		"no-topology-policy": {
 			Inputs:  []v1beta1.AppPolicy{},
 			Outputs: []v1alpha1.PlacementDecision{{Cluster: "local", Namespace: ""}},
+		},
+		"empty-topology-policy": {
+			Inputs: []v1beta1.AppPolicy{{Type: "topology", Name: "some-name", Properties: nil}},
+			Error:  "have empty properties",
 		},
 	}
 	for name, tt := range testCases {

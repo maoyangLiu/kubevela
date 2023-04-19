@@ -23,8 +23,9 @@ import (
 	"k8s.io/client-go/util/flowcontrol"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	"github.com/kubevela/pkg/multicluster"
+
 	cmdutil "github.com/oam-dev/kubevela/pkg/cmd/util"
-	"github.com/oam-dev/kubevela/pkg/multicluster"
 	"github.com/oam-dev/kubevela/pkg/utils/common"
 )
 
@@ -96,7 +97,7 @@ func (f *defaultFactory) Config() *rest.Config {
 func NewDefaultFactory(cfg *rest.Config) Factory {
 	copiedCfg := *cfg
 	copiedCfg.RateLimiter = DefaultRateLimiter
-	copiedCfg.Wrap(multicluster.NewSecretModeMultiClusterRoundTripper)
+	copiedCfg.Wrap(multicluster.NewTransportWrapper())
 	return &defaultFactory{cfg: &copiedCfg}
 }
 
@@ -135,4 +136,22 @@ func (f *deferredFactory) Client() client.Client {
 		f.init()
 	}
 	return f.Factory.Client()
+}
+
+type testFactory struct {
+	cfg *rest.Config
+	cli client.Client
+}
+
+// NewTestFactory new a factory for the testing
+func NewTestFactory(cfg *rest.Config,
+	cli client.Client) Factory {
+	return &testFactory{cli: cli, cfg: cfg}
+}
+
+func (t *testFactory) Client() client.Client {
+	return t.cli
+}
+func (t *testFactory) Config() *rest.Config {
+	return t.cfg
 }

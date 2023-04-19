@@ -28,9 +28,11 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/yaml"
 
+	monitorContext "github.com/kubevela/pkg/monitor/context"
+	workflowv1alpha1 "github.com/kubevela/workflow/api/v1alpha1"
+
 	"github.com/oam-dev/kubevela/apis/core.oam.dev/common"
 	oamcore "github.com/oam-dev/kubevela/apis/core.oam.dev/v1beta1"
-	monitorContext "github.com/oam-dev/kubevela/pkg/monitor/context"
 	"github.com/oam-dev/kubevela/pkg/oam/util"
 )
 
@@ -81,7 +83,7 @@ var _ = Describe("Test Application workflow generator", func() {
 						Name:       "myweb1",
 						Type:       "worker-with-health",
 						Properties: &runtime.RawExtension{Raw: []byte(`{"cmd":["sleep","1000"],"image":"busybox"}`)},
-						Inputs: common.StepInputs{
+						Inputs: workflowv1alpha1.StepInputs{
 							{
 								From:         "message",
 								ParameterKey: "properties.enemies",
@@ -96,7 +98,7 @@ var _ = Describe("Test Application workflow generator", func() {
 						Name:       "myweb2",
 						Type:       "worker-with-health",
 						Properties: &runtime.RawExtension{Raw: []byte(`{"cmd":["sleep","1000"],"image":"busybox","lives": "i am lives","enemies": "empty"}`)},
-						Outputs: common.StepOutputs{
+						Outputs: workflowv1alpha1.StepOutputs{
 							{
 								Name:      "message",
 								ValueFrom: "output.status.conditions[0].message+\",\"+outputs.gameconfig.data.lives",
@@ -110,13 +112,15 @@ var _ = Describe("Test Application workflow generator", func() {
 		Expect(err).Should(BeNil())
 		_, err = af.GeneratePolicyManifests(context.Background())
 		Expect(err).Should(BeNil())
-		appRev := &oamcore.ApplicationRevision{}
 
 		handler, err := NewAppHandler(ctx, reconciler, app, appParser)
 		Expect(err).Should(Succeed())
 
 		logCtx := monitorContext.NewTraceContext(ctx, "")
-		taskRunner, err := handler.GenerateApplicationSteps(logCtx, app, appParser, af, appRev)
+		handler.currentAppRev = &oamcore.ApplicationRevision{}
+		handler.CheckWorkflowRestart(logCtx, app)
+
+		_, taskRunner, err := handler.GenerateApplicationSteps(logCtx, app, appParser, af)
 		Expect(err).To(BeNil())
 		Expect(len(taskRunner)).Should(BeEquivalentTo(2))
 		Expect(taskRunner[0].Name()).Should(BeEquivalentTo("myweb1"))
@@ -152,13 +156,14 @@ var _ = Describe("Test Application workflow generator", func() {
 		Expect(err).Should(BeNil())
 		_, err = af.GeneratePolicyManifests(context.Background())
 		Expect(err).Should(BeNil())
-		appRev := &oamcore.ApplicationRevision{}
 
 		handler, err := NewAppHandler(ctx, reconciler, app, appParser)
 		Expect(err).Should(Succeed())
 
 		logCtx := monitorContext.NewTraceContext(ctx, "")
-		taskRunner, err := handler.GenerateApplicationSteps(logCtx, app, appParser, af, appRev)
+		handler.currentAppRev = &oamcore.ApplicationRevision{}
+		handler.CheckWorkflowRestart(logCtx, app)
+		_, taskRunner, err := handler.GenerateApplicationSteps(logCtx, app, appParser, af)
 		Expect(err).To(BeNil())
 		Expect(len(taskRunner)).Should(BeEquivalentTo(2))
 		Expect(taskRunner[0].Name()).Should(BeEquivalentTo("myweb1"))
@@ -215,15 +220,17 @@ var _ = Describe("Test Application workflow generator", func() {
 				Namespace: namespaceName,
 			},
 			Spec: oamcore.ApplicationRevisionSpec{
-				Application:          *app.DeepCopy(),
-				ComponentDefinitions: make(map[string]oamcore.ComponentDefinition),
-				WorkloadDefinitions:  make(map[string]oamcore.WorkloadDefinition),
-				TraitDefinitions:     make(map[string]oamcore.TraitDefinition),
-				ScopeDefinitions:     make(map[string]oamcore.ScopeDefinition),
+				ApplicationRevisionCompressibleFields: oamcore.ApplicationRevisionCompressibleFields{
+					Application:          *app.DeepCopy(),
+					ComponentDefinitions: make(map[string]*oamcore.ComponentDefinition),
+					WorkloadDefinitions:  make(map[string]oamcore.WorkloadDefinition),
+					TraitDefinitions:     make(map[string]*oamcore.TraitDefinition),
+					ScopeDefinitions:     make(map[string]oamcore.ScopeDefinition),
+				},
 			},
 		}
-		apprev.Spec.ComponentDefinitions["worker"] = *cd
-		apprev.Spec.TraitDefinitions["rollout"] = *td
+		apprev.Spec.ComponentDefinitions["worker"] = cd.DeepCopy()
+		apprev.Spec.TraitDefinitions["rollout"] = td.DeepCopy()
 		Expect(k8sClient.Create(ctx, apprev)).Should(BeNil())
 
 		handler, err := NewAppHandler(ctx, reconciler, app, appParser)
@@ -240,7 +247,7 @@ var _ = Describe("Test Application workflow generator", func() {
 				},
 			},
 		}
-		_, _, err = renderFunc(comp, nil, "", "", "")
+		_, _, err = renderFunc(ctx, comp, nil, "", "", "")
 		Expect(err).Should(BeNil())
 	})
 
@@ -272,13 +279,14 @@ var _ = Describe("Test Application workflow generator", func() {
 		}
 		af, err := appParser.GenerateAppFile(ctx, app)
 		Expect(err).Should(BeNil())
-		appRev := &oamcore.ApplicationRevision{}
 
 		handler, err := NewAppHandler(ctx, reconciler, app, appParser)
 		Expect(err).Should(Succeed())
 
 		logCtx := monitorContext.NewTraceContext(ctx, "")
-		taskRunner, err := handler.GenerateApplicationSteps(logCtx, app, appParser, af, appRev)
+		handler.currentAppRev = &oamcore.ApplicationRevision{}
+		handler.CheckWorkflowRestart(logCtx, app)
+		_, taskRunner, err := handler.GenerateApplicationSteps(logCtx, app, appParser, af)
 		Expect(err).To(BeNil())
 		Expect(len(taskRunner)).Should(BeEquivalentTo(2))
 		Expect(taskRunner[0].Name()).Should(BeEquivalentTo("myweb1"))
@@ -313,13 +321,14 @@ var _ = Describe("Test Application workflow generator", func() {
 		}
 		af, err := appParser.GenerateAppFile(ctx, app)
 		Expect(err).Should(BeNil())
-		appRev := &oamcore.ApplicationRevision{}
 
 		handler, err := NewAppHandler(ctx, reconciler, app, appParser)
 		Expect(err).Should(Succeed())
 
 		logCtx := monitorContext.NewTraceContext(ctx, "")
-		_, err = handler.GenerateApplicationSteps(logCtx, app, appParser, af, appRev)
+		handler.currentAppRev = &oamcore.ApplicationRevision{}
+		handler.CheckWorkflowRestart(logCtx, app)
+		_, _, err = handler.GenerateApplicationSteps(logCtx, app, appParser, af)
 		Expect(err).NotTo(BeNil())
 	})
 
@@ -351,13 +360,14 @@ var _ = Describe("Test Application workflow generator", func() {
 		}
 		af, err := appParser.GenerateAppFile(ctx, app)
 		Expect(err).Should(BeNil())
-		appRev := &oamcore.ApplicationRevision{}
 
 		handler, err := NewAppHandler(ctx, reconciler, app, appParser)
 		Expect(err).Should(Succeed())
 
 		logCtx := monitorContext.NewTraceContext(ctx, "")
-		_, err = handler.GenerateApplicationSteps(logCtx, app, appParser, af, appRev)
+		handler.currentAppRev = &oamcore.ApplicationRevision{}
+		handler.CheckWorkflowRestart(logCtx, app)
+		_, _, err = handler.GenerateApplicationSteps(logCtx, app, appParser, af)
 		Expect(err).NotTo(BeNil())
 	})
 })

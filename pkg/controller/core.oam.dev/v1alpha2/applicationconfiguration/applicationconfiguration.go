@@ -27,6 +27,7 @@ import (
 	"github.com/crossplane/crossplane-runtime/pkg/fieldpath"
 	"github.com/crossplane/crossplane-runtime/pkg/meta"
 	"github.com/crossplane/crossplane-runtime/pkg/resource"
+	ctrlrec "github.com/kubevela/pkg/controller/reconciler"
 	"github.com/pkg/errors"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -219,7 +220,7 @@ func NewReconciler(m ctrl.Manager, dm discoverymapper.DiscoveryMapper, o ...Reco
 // Reconcile an OAM ApplicationConfigurations by rendering and instantiating its
 // Components and Traits.
 func (r *OAMApplicationReconciler) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
-	ctx, cancel := common.NewReconcileContext(ctx)
+	ctx, cancel := ctrlrec.NewReconcileContext(ctx)
 	defer cancel()
 
 	klog.InfoS("Reconcile applicationConfiguration", "applicationConfiguration", klog.KRef(req.Namespace, req.Name))
@@ -407,7 +408,7 @@ func (r *OAMApplicationReconciler) confirmDeleteOnApplyOnceMode(ctx context.Cont
 }
 
 // UpdateStatus updates v1alpha2.ApplicationConfiguration's Status with retry.RetryOnConflict
-func (r *OAMApplicationReconciler) UpdateStatus(ctx context.Context, ac *v1alpha2.ApplicationConfiguration, opts ...client.UpdateOption) error {
+func (r *OAMApplicationReconciler) UpdateStatus(ctx context.Context, ac *v1alpha2.ApplicationConfiguration, opts ...client.SubResourceUpdateOption) error {
 	status := ac.DeepCopy().Status
 	return retry.RetryOnConflict(retry.DefaultBackoff, func() (err error) {
 		if err = r.client.Get(ctx, types.NamespacedName{Namespace: ac.Namespace, Name: ac.Name}, ac); err != nil {

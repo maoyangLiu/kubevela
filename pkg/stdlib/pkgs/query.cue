@@ -50,15 +50,48 @@
 		deployVersion?:   string
 		revision?:        string
 		latest?:          bool
+		resourceTree?: {
+			...
+		}
 	}]
 	...
 }
 
 #CollectPods: {
-	#do:       "collectPods"
+	#do:       "collectResources"
 	#provider: "query"
-	value: {...}
-	cluster: string
+	app: {
+		name:      string
+		namespace: string
+		filter?: {
+			cluster?:          string
+			clusterNamespace?: string
+			components?: [...string]
+			kind:       "Pod"
+			apiVersion: "v1"
+		}
+		withTree: true
+	}
+	list: [...{...}]
+	...
+}
+
+#CollectServices: {
+	#do:       "collectResources"
+	#provider: "query"
+	app: {
+		name:      string
+		namespace: string
+		filter?: {
+			cluster?:          string
+			clusterNamespace?: string
+			components?: [...string]
+			kind:       "Service"
+			apiVersion: "v1"
+		}
+		withTree: true
+	}
+	list: [...{...}]
 	...
 }
 
@@ -86,9 +119,9 @@
 		limitBytes:   *null | int
 	}
 	outputs?: {
-		logs: string
-		err?: string
-		info: {
+		logs?: string
+		err?:  string
+		info?: {
 			fromDate: string
 			toDate:   string
 		}
@@ -108,6 +141,7 @@
 			clusterNamespace?: string
 			components?: [...string]
 		}
+		withTree: true
 	}
 	list?: [...{
 		endpoint: {
@@ -115,7 +149,9 @@
 			appProtocol?: string
 			host?:        string
 			port:         int
+			portName?:    string
 			path?:        string
+			inner?:       bool
 		}
 		ref: {...}
 		cluster?:   string
@@ -126,7 +162,7 @@
 }
 
 #GetApplicationTree: {
-	#do:       "getApplicationTree"
+	#do:       "listAppliedResources"
 	#provider: "query"
 	app: {
 		name:      string
@@ -136,6 +172,7 @@
 			clusterNamespace?: string
 			components?: [...string]
 		}
+		withTree: true
 	}
 	list?: [...{
 		name:             string
